@@ -122,12 +122,7 @@ export class JobManager {
 
     this.registry.set(id, job);
     if (this.settings().keepHistory) {
-      try {
-        downloadRepository.insert(job);
-      } catch (err) {
-        // DB might be unavailable in edge builds — keep in-memory only.
-        void err;
-      }
+      downloadRepository.insert(job);
     }
 
     this.enqueue(async () => {
@@ -206,7 +201,14 @@ export class JobManager {
     }
     this.registry.delete(id);
     this.abortControllers.delete(id);
-    downloadRepository.delete(id);
+    try {
+      const result = downloadRepository.delete(id);
+      if (result.changes === 0) {
+        console.warn(`[JobManager] Job ${id} not found in database during delete`);
+      }
+    } catch (err) {
+      console.error(`[JobManager] Failed to delete job ${id} from database:`, err);
+    }
   }
 
   private markStatus(

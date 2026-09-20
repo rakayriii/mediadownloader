@@ -247,8 +247,9 @@ export const downloadRepository = {
     };
   },
 
-  delete(id: string): void {
-    getDb().prepare("DELETE FROM downloads WHERE id = ?").run(id);
+  delete(id: string): { changes: number } {
+    const result = getDb().prepare("DELETE FROM downloads WHERE id = ?").run(id);
+    return { changes: Number(result.changes) };
   },
 };
 
