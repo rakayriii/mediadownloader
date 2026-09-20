@@ -1,0 +1,16 @@
+# .dockerignore for MediaVault
+node_modules
+.next
+.git
+.gitignore
+README.md
+*.log
+npm-debug.log*
+.DS_Store
+*.pem
+.vercel
+coverage
+.nyc_output
+.env*
+!.env.example
+*.tsbuildinfo
