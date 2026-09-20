@@ -1,10 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "docker",
-  "dockerfile": "Dockerfile.vercel",
-  "buildCommand": "echo 'Building with Docker'",
-  "devCommand": "echo 'Use docker compose for local dev'",
-  "installCommand": "echo 'Using Docker - no install needed'",
   "regions": ["sin1"],
   "functions": {
     "src/app/api/**/*.ts": {
