@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "docker",
+  "framework": "container",
   "regions": ["sin1"],
   "functions": {
     "src/app/api/**/*.ts": {
