@@ -61,6 +61,8 @@ export class JobManager {
   private queue: Array<() => Promise<void>> = [];
   private active = 0;
   private maxConcurrency = 2;
+  /** Job IDs that have been explicitly removed — prevents re-adding from race conditions. */
+  private removedJobs = new Set<string>();
 
   constructor() {
     this.maxConcurrency = this.readConcurrency();
@@ -186,6 +188,7 @@ export class JobManager {
   /** Remove a job from history + registry and delete its output file. */
   remove(id: string): void {
     this.cancel(id);
+    this.removedJobs.add(id);
     const job = this.get(id);
     if (job?.fileName && job.fileName.length > 0 && !job.batchId) {
       const settings = this.settings();
@@ -243,6 +246,7 @@ export class JobManager {
   }
 
   private markCancelled(id: string): void {
+    if (this.removedJobs.has(id)) return;
     const job = this.get(id);
     if (!job) return;
     const next: DownloadJob = {
@@ -434,6 +438,7 @@ export class JobManager {
     message: string,
     details?: unknown
   ): void {
+    if (this.removedJobs.has(id)) return;
     const current = this.get(id);
     if (!current) return;
     const next: DownloadJob = {
