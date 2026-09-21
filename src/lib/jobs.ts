@@ -26,13 +26,14 @@ import type {
   DownloadJob,
   JobStatus,
   JobType,
+  AppSettings,
 } from "@/lib/types";
 
 /**
  * Background job orchestrator.
  *
  * Live state (progress) lives in an in-memory registry; persistent state is
- * mirrored to SQLite at every status milestone. Downloads run through a
+ * mirrored to PostgreSQL at every status milestone. Downloads run through a
  * concurrency-bounded queue so batches can't saturate the server.
  */
 
@@ -70,7 +71,7 @@ export class JobManager {
 
   private readConcurrency(): number {
     try {
-      const settings = settingsRepository.getAll();
+      const settings = settingsRepository.getAllSync();
       const n = Number(settings.concurrency);
       return n >= 1 && n <= 10 ? n : 2;
     } catch {
@@ -78,17 +79,17 @@ export class JobManager {
     }
   }
 
-  private settings(): ReturnType<typeof settingsRepository.getAll> {
-    return settingsRepository.getAll();
+  private settings(): AppSettings {
+    return settingsRepository.getAllSync();
   }
 
   /** Job metadata merging live progress + persisted fields. */
-  get(id: string): DownloadJob | null {
-    return this.registry.get(id) ?? downloadRepository.get(id);
+  async get(id: string): Promise<DownloadJob | null> {
+    return this.registry.get(id) ?? (await downloadRepository.get(id));
   }
 
-  list(): DownloadJob[] {
-    const rows = downloadRepository.list({ limit: 200 }).items;
+  async list(): Promise<DownloadJob[]> {
+    const rows = (await downloadRepository.list({ limit: 200 })).items;
     const seen = new Set(rows.map((r) => r.id));
     const liveOnly = [...this.registry.values()]
       .filter((j) => !seen.has(j.id) && j.status !== "cancelled")
@@ -124,7 +125,10 @@ export class JobManager {
 
     this.registry.set(id, job);
     if (this.settings().keepHistory) {
-      downloadRepository.insert(job);
+      // Fire and forget - don't block job creation
+      downloadRepository.insert(job).catch((err) => {
+        console.error("[JobManager] Failed to persist new job:", err);
+      });
     }
 
     this.enqueue(async () => {
@@ -133,8 +137,8 @@ export class JobManager {
     return job;
   }
 
-  cancel(id: string): DownloadJob | null {
-    const job = this.registry.get(id) ?? downloadRepository.get(id);
+  async cancel(id: string): Promise<DownloadJob | null> {
+    const job = this.registry.get(id) ?? (await downloadRepository.get(id));
     if (!job) return null;
     if (job.status === "completed" || job.status === "cancelled" || job.status === "failed") {
       return job;
@@ -143,14 +147,14 @@ export class JobManager {
     controller?.abort();
     this.abortControllers.delete(id);
     if (job.status === "queued") {
-      this.markCancelled(id);
+      await this.markCancelled(id);
     }
     return this.get(id);
   }
 
   /** Reset a failed/cancelled job and re-enqueue it. */
-  retry(id: string): DownloadJob | null {
-    const job = this.get(id);
+  async retry(id: string): Promise<DownloadJob | null> {
+    const job = await this.get(id);
     if (!job) return null;
     if (job.status === "running" || job.status === "queued") return job;
 
@@ -166,7 +170,7 @@ export class JobManager {
       startedAt: null,
     };
     this.registry.set(id, reset);
-    downloadRepository.update(reset);
+    await downloadRepository.update(reset);
 
     this.enqueue(async () => {
       await this.runJob(id, {
@@ -186,10 +190,10 @@ export class JobManager {
   }
 
   /** Remove a job from history + registry and delete its output file. */
-  remove(id: string): void {
-    this.cancel(id);
+  async remove(id: string): Promise<void> {
+    await this.cancel(id);
     this.removedJobs.add(id);
-    const job = this.get(id);
+    const job = await this.get(id);
     if (job?.fileName && job.fileName.length > 0 && !job.batchId) {
       const settings = this.settings();
       const dir = settings.downloadPath || DOWNLOADS_DIR;
@@ -205,21 +209,22 @@ export class JobManager {
     this.registry.delete(id);
     this.abortControllers.delete(id);
     try {
-      const result = downloadRepository.delete(id);
+      const result = await downloadRepository.delete(id);
       if (result.changes === 0) {
         console.warn(`[JobManager] Job ${id} not found in database during delete`);
       }
     } catch (err) {
       console.error(`[JobManager] Failed to delete job ${id} from database:`, err);
+      throw err; // Re-throw so API can return error
     }
   }
 
-  private markStatus(
+  private async markStatus(
     id: string,
     status: JobStatus,
     patch: Partial<DownloadJob> = {}
-  ): void {
-    const current = this.get(id);
+  ): Promise<void> {
+    const current = await this.get(id);
     if (!current) return;
     const next: DownloadJob = {
       ...current,
@@ -232,22 +237,19 @@ export class JobManager {
     if (status === "completed" || status === "failed" || status === "cancelled") {
       next.completedAt = new Date().toISOString();
       this.registry.set(id, next);
-      downloadRepository.update(next);
+      await downloadRepository.update(next);
       void this.closeWorkDir(id);
-      this.signalBatchItem(id, status);
+      await this.signalBatchItem(id, status);
       this.abortControllers.delete(id);
-      if (status === "completed" || status === "failed") {
-        // keep last progress snapshot for the UI
-      }
       return;
     }
     this.registry.set(id, next);
-    downloadRepository.update(next);
+    await downloadRepository.update(next);
   }
 
-  private markCancelled(id: string): void {
+  private async markCancelled(id: string): Promise<void> {
     if (this.removedJobs.has(id)) return;
-    const job = this.get(id);
+    const job = await this.get(id);
     if (!job) return;
     const next: DownloadJob = {
       ...job,
@@ -258,8 +260,8 @@ export class JobManager {
       progress: { stage: "queued", message: "Cancelled" },
     };
     this.registry.set(id, next);
-    downloadRepository.update(next);
-    this.signalBatchItem(id, "cancelled");
+    await downloadRepository.update(next);
+    await this.signalBatchItem(id, "cancelled");
     this.abortControllers.delete(id);
   }
 
@@ -298,7 +300,7 @@ export class JobManager {
     id: string,
     input: CreateDownloadInput
   ): Promise<void> {
-    const job = this.get(id);
+    const job = await this.get(id);
     if (!job || job.status === "cancelled") return;
 
     const controller = new AbortController();
@@ -307,11 +309,11 @@ export class JobManager {
     const settings = this.settings();
     const binaryOverride = settings.ytdlpPath || process.env.YTDLP_PATH;
     if (binaryOverride && !existsSync(binaryOverride)) {
-      this.markFailed(id, "YTDLP_NOT_FOUND", "The configured yt-dlp path does not exist.");
+      await this.markFailed(id, "YTDLP_NOT_FOUND", "The configured yt-dlp path does not exist.");
       return;
     }
     if (!binaryOverride && !resolveYtdlpPath()) {
-      this.markFailed(
+      await this.markFailed(
         id,
         "YTDLP_NOT_FOUND",
         "yt-dlp is not installed on this server. Install it (or set YTDLP_PATH) to enable downloads."
@@ -319,7 +321,7 @@ export class JobManager {
       return;
     }
 
-    this.markStatus(id, "running", {
+    await this.markStatus(id, "running", {
       progress: { stage: "analyzing", message: "Fetching media metadata…" },
       startedAt: new Date().toISOString(),
     });
@@ -340,7 +342,7 @@ export class JobManager {
           thumbnail: info.thumbnail,
           duration: info.duration,
         };
-        this.markStatus(id, "running", {
+        await this.markStatus(id, "running", {
           title: info.title,
           uploader: info.uploader,
           thumbnail: info.thumbnail,
@@ -349,11 +351,11 @@ export class JobManager {
         });
       } catch (err) {
         if (controller.signal.aborted) {
-          this.markCancelled(id);
+          await this.markCancelled(id);
           return;
         }
         const appError = toAppError(err);
-        this.markFailed(id, appError.code, appError.message, appError.details);
+        await this.markFailed(id, appError.code, appError.message, appError.details);
         return;
       }
     }
@@ -391,16 +393,16 @@ export class JobManager {
       });
 
       if (controller.signal.aborted) {
-        this.markCancelled(id);
+        await this.markCancelled(id);
         return;
       }
     } catch (err) {
       if (controller.signal.aborted) {
-        this.markCancelled(id);
+        await this.markCancelled(id);
         return;
       }
       const appError = toAppError(err);
-      this.markFailed(id, appError.code, appError.message, appError.details);
+      await this.markFailed(id, appError.code, appError.message, appError.details);
       return;
     }
 
@@ -416,7 +418,7 @@ export class JobManager {
       }
     }
 
-    this.markStatus(id, "completed", {
+    await this.markStatus(id, "completed", {
       progress: {
         stage: "finalizing",
         percent: 100,
@@ -432,14 +434,14 @@ export class JobManager {
     });
   }
 
-  private markFailed(
+  private async markFailed(
     id: string,
     code: string,
     message: string,
     details?: unknown
-  ): void {
+  ): Promise<void> {
     if (this.removedJobs.has(id)) return;
-    const current = this.get(id);
+    const current = await this.get(id);
     if (!current) return;
     const next: DownloadJob = {
       ...current,
@@ -455,18 +457,18 @@ export class JobManager {
       next.error = detailStr.length > 400 ? `${detailStr.slice(0, 400)}…` : detailStr;
     }
     this.registry.set(id, next);
-    downloadRepository.update(next);
-    this.signalBatchItem(id, "failed");
+    await downloadRepository.update(next);
+    await this.signalBatchItem(id, "failed");
     this.abortControllers.delete(id);
   }
 
   // ---------------------------------------------------------------- batches
 
-  private signalBatchItem(jobId: string, status: JobStatus): void {
-    const job = this.get(jobId);
+  private async signalBatchItem(jobId: string, status: JobStatus): Promise<void> {
+    const job = await this.get(jobId);
     if (!job?.batchId) return;
     const batchId = job.batchId;
-    const batch = batchRepository.get(batchId);
+    const batch = await batchRepository.get(batchId);
     if (!batch) return;
 
     const item = batch.items.find((i) => i.jobId === jobId);
@@ -478,9 +480,9 @@ export class JobManager {
         : status === "cancelled"
           ? "cancelled"
           : "failed";
-    batchRepository.updateItem({ id: item.id, status: itemStatus });
+    await batchRepository.updateItem({ id: item.id, status: itemStatus });
 
-    const updated = batchRepository.get(batchId);
+    const updated = await batchRepository.get(batchId);
     if (!updated) return;
     const counts = updated.counts;
     const done = counts.completed + counts.failed + counts.cancelled;
@@ -497,7 +499,7 @@ export class JobManager {
       status: nextStatus,
       completedAt: done >= counts.total ? new Date().toISOString() : updated.completedAt,
     };
-    batchRepository.update(patch);
+    await batchRepository.update(patch);
   }
 }
 

@@ -19,17 +19,17 @@ interface RouteParams {
 function encodeContentDispositionFilename(filename: string): string {
   // Try to use ASCII-only filename (strip non-Latin1 chars)
   const asciiFilename = filename.replace(/[^\x00-\x7F]/g, "_");
-  
+
   // If filename contains only ASCII, use simple format
   if (asciiFilename === filename) {
     return `filename="${filename}"`;
   }
-  
+
   // Otherwise use RFC 5987 encoding with UTF-8
   const encoded = encodeURIComponent(filename)
     .replace(/['()]/g, escape) // escape special chars
     .replace(/\*/g, "%2A");
-  
+
   // Provide both: legacy `filename` (ASCII-safe) and RFC 5987 `filename*`
   return `filename="${asciiFilename}"; filename*=UTF-8''${encoded}`;
 }
@@ -41,7 +41,7 @@ function encodeContentDispositionFilename(filename: string): string {
 export async function GET(request: NextRequest, ctx: RouteParams) {
   try {
     const { id } = await ctx.params;
-    const job = jobManager.get(id);
+    const job = await jobManager.get(id);
 
     if (!job) {
       throw new AppError("NOT_FOUND", "Download job not found");
@@ -57,7 +57,7 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
 
     // Get the download directory from settings or use default
     const { settingsRepository } = await import("@/lib/db");
-    const settings = settingsRepository.getAll();
+    const settings = await settingsRepository.getAll();
     const baseDir = settings.downloadPath
       ? join(settings.downloadPath, "mediavault")
       : DOWNLOADS_DIR;

@@ -16,8 +16,6 @@ export const DATA_DIR = process.env.MEDIAVAULT_DATA_DIR
   ? resolve(process.env.MEDIAVAULT_DATA_DIR)
   : join(projectRoot(), ".mediavault");
 
-export const DATABASE_PATH = join(DATA_DIR, "mediavault.db");
-
 export const DOWNLOADS_DIR =
   process.env.MEDIAVAULT_DOWNLOADS_DIR ?? join(DATA_DIR, "downloads");
 
@@ -61,6 +59,9 @@ export const SWEEP_INTERVAL_MINUTES = Number(
 
 /** Default concurrency for background downloads when settings are unavailable. */
 export const DEFAULT_CONCURRENCY = 2;
+
+/** PostgreSQL database URL for Prisma. */
+export const DATABASE_URL = process.env.DATABASE_URL ?? "";
 
 const KNOWN_BINARY_DIRS = [
   process.env.YTDLP_PATH,

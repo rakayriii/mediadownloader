@@ -48,7 +48,7 @@ export async function createBatch(urlsRaw: string[]): Promise<CreateBatchResult>
   for (const item of items) {
     const check = await validateUrlSafe(item.url);
     if (!check.ok || !check.url) {
-      batchRepository.updateItem({
+      await batchRepository.updateItem({
         id: item.id,
         status: "failed",
         error: check.error ?? "Invalid URL",
@@ -75,15 +75,16 @@ export async function createBatch(urlsRaw: string[]): Promise<CreateBatchResult>
     completedAt: null,
   };
 
-  batchRepository.insert(initialBatch, items);
+  await batchRepository.insert(initialBatch, items);
 
   if (valid.length === 0) {
-    batchRepository.update({
+    await batchRepository.update({
       ...initialBatch,
       status: "failed",
       completedAt: now,
     });
-    return { batch: batchRepository.get(batchId)!, invalidCount: items.length };
+    const failedBatch = await batchRepository.get(batchId);
+    return { batch: failedBatch!, invalidCount: items.length };
   }
 
   // Enqueue child jobs — each links back to the batch and its item.
@@ -98,15 +99,15 @@ export async function createBatch(urlsRaw: string[]): Promise<CreateBatchResult>
       duration: meta.duration,
       batchId,
     });
-    batchRepository.updateItem({
+    await batchRepository.updateItem({
       id: item.id,
       status: "running",
       jobId: job.id,
     });
   }
 
-  const fresh = batchRepository.get(batchId)!;
-  return { batch: fresh, invalidCount: items.length - valid.length };
+  const fresh = await batchRepository.get(batchId);
+  return { batch: fresh!, invalidCount: items.length - valid.length };
 }
 
 async function validateUrlSafe(raw: string): Promise<{ ok: boolean; url?: string; error?: string }> {

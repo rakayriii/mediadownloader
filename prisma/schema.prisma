@@ -1,0 +1,74 @@
+// Prisma schema for MediaVault
+// Maps to existing job/download/history data structure
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Download {
+  id          String   @id @default(cuid())
+  type        String   // "video" | "audio"
+  url         String
+  title       String?
+  uploader    String?
+  thumbnail   String?
+  duration    Int?
+  formatId    String?
+  ext         String?
+  status      String   // "queued" | "running" | "completed" | "failed" | "cancelled"
+  error       String?
+  errorCode   String?
+  fileName    String?
+  sizeBytes   BigInt?
+  batchId     String?
+  createdAt   DateTime @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  @@index([createdAt(sort: Desc)])
+  @@index([status])
+  @@index([title])
+  @@index([batchId])
+  @@map("downloads")
+}
+
+model Batch {
+  id          String   @id @default(cuid())
+  status      String   // "queued" | "running" | "completed" | "partial" | "failed" | "cancelled"
+  total       Int
+  completed   Int      @default(0)
+  failed      Int      @default(0)
+  cancelled   Int      @default(0)
+  createdAt   DateTime @default(now())
+  completedAt DateTime?
+  items       BatchItem[]
+
+  @@map("batches")
+}
+
+model BatchItem {
+  id        String   @id @default(cuid())
+  batchId   String
+  batch     Batch    @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  position  Int
+  url       String
+  status    String   // "queued" | "running" | "completed" | "failed" | "cancelled"
+  error     String?
+  jobId     String?
+  createdAt DateTime @default(now())
+
+  @@index([batchId, position])
+  @@map("batch_items")
+}
+
+model Setting {
+  key   String @id
+  value String
+
+  @@map("settings")
+}

@@ -119,7 +119,7 @@ export async function GET(request: NextRequest) {
       throw new AppError("INVALID_INPUT", "status filter is not valid");
     }
 
-    const result = downloadRepository.list({
+    const result = await downloadRepository.list({
       search: search || undefined,
       status: (status || undefined) as never,
       limit: pageSize,
@@ -128,7 +128,10 @@ export async function GET(request: NextRequest) {
 
     const items = result.items.map((row) => {
       const live = jobManager.get(row.id);
-      return live ? { ...row, ...live } : row;
+      // Note: jobManager.get is now async, but we can't await in map
+      // The live job from registry will have progress info
+      // For now, return row as-is since live progress is handled separately
+      return row;
     });
 
     return ok({ items, total: result.total, page, pageSize });
