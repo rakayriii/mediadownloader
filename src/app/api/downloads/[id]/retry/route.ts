@@ -16,9 +16,9 @@ interface RouteParams {
 export async function POST(_request: NextRequest, ctx: RouteParams) {
   try {
     const { id } = await ctx.params;
-    const job = jobManager.get(id);
+    const job = await jobManager.get(id);
     if (!job) throw new AppError("NOT_FOUND", "Download job not found");
-    const updated = jobManager.retry(id);
+    const updated = await jobManager.retry(id);
     if (!updated) throw new AppError("NOT_FOUND", "Download job not found");
     return ok({ job: updated });
   } catch (err) {

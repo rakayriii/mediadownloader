@@ -14,7 +14,7 @@ const VALID_AUDIO_FORMATS = ["mp3", "m4a", "opus", "wav", "aac", "flac", "vorbis
  */
 export async function GET() {
   try {
-    const settings = settingsRepository.getAll();
+    const settings = await settingsRepository.getAll();
     return ok({ settings });
   } catch (err) {
     return fail(err);
@@ -73,8 +73,8 @@ export async function POST(request: NextRequest) {
       throw new AppError("INVALID_INPUT", "keepHistory must be a boolean");
     }
 
-    settingsRepository.setAll(body as AppSettings);
-    const settings = settingsRepository.getAll();
+    await settingsRepository.setAll(body as AppSettings);
+    const settings = await settingsRepository.getAll();
 
     return ok({ settings });
   } catch (err) {
