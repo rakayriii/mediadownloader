@@ -128,7 +128,10 @@ export async function fetchFromStorage(
         headers: headersFor(storage, range ? { Range: range } : undefined),
       }
     );
-    if (res.status === 404) return null;
+    // Supabase Storage answers missing objects with 400 (body claims 404) —
+    // treat every non-2xx as a miss so callers fall through to their own
+    // clean NOT_FOUND instead of echoing the upstream error body.
+    if (!res.ok) return null;
     return {
       status: res.status,
       contentType: res.headers.get("content-type"),

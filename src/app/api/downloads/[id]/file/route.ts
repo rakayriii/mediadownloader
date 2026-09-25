@@ -85,6 +85,18 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
     // If exact match not found, search for file in download directory
     if (!existsSync(filePath)) {
       console.log(`[File API] Exact file not found: ${filePath}, searching directory...`);
+      if (!existsSync(baseDir)) {
+        // Fresh container/instance: the download dir may never have been
+        // created here. Skip straight to the storage mirror.
+        console.log(`[File API] Download directory missing: ${baseDir}`);
+        const mirrored = await serveFromStorage(
+          job,
+          request.headers.get("range"),
+          forceDownload
+        );
+        if (mirrored) return mirrored;
+        throw new AppError("NOT_FOUND", "File not found on disk");
+      }
       const entries = readdirSync(baseDir, { withFileTypes: true });
       const match = entries.find((entry) => {
         if (!entry.isFile()) return false;
