@@ -9,6 +9,7 @@ import {
   mimeForExt,
 } from "@/lib/storage";
 import { createReadStream, statSync, existsSync, readdirSync } from "node:fs";
+import { Readable } from "node:stream";
 import { join, resolve, basename } from "node:path";
 import type { DownloadJob } from "@/lib/types";
 
@@ -139,9 +140,11 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
       const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
       const chunkSize = end - start + 1;
 
-      const stream = createReadStream(filePath, { start, end });
+      const stream = Readable.toWeb(
+        createReadStream(filePath, { start, end })
+      ) as ReadableStream;
 
-      return new Response(stream as unknown as ReadableStream, {
+      return new Response(stream, {
         status: 206,
         headers: {
           "Content-Range": `bytes ${start}-${end}/${fileSize}`,
@@ -154,9 +157,9 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
     }
 
     // Full file response
-    const stream = createReadStream(filePath);
+    const stream = Readable.toWeb(createReadStream(filePath)) as ReadableStream;
 
-    return new Response(stream as unknown as ReadableStream, {
+    return new Response(stream, {
       headers: {
         "Content-Length": fileSize.toString(),
         "Content-Type": contentType,
