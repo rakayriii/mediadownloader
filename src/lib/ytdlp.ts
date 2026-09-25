@@ -50,6 +50,13 @@ export function ytdlpVersion(): Promise<string | null> {
     .catch(() => null);
 }
 
+/** Version string resolved at most once per process. */
+let cachedYtdlpVersionPromise: Promise<string | null> | null = null;
+function cachedYtdlpVersion(): Promise<string | null> {
+  cachedYtdlpVersionPromise ??= ytdlpVersion();
+  return cachedYtdlpVersionPromise;
+}
+
 /** Strip characters that are illegal or dangerous in file names. */
 export function sanitizeFilename(raw: string, maxLength = 160): string {
   const cleaned = raw
@@ -151,6 +158,11 @@ export async function analyzeMedia(
   const bin = requireBinary();
   // Skip DNS resolution for analysis - yt-dlp does its own validation
   const url = (await assertValidUrl(rawUrl, { resolveDns: false })).toString();
+
+  // Resolve the binary version once per process so production failures are
+  // attributable (e.g. an old in-container yt-dlp vs. a network block).
+  const version = await cachedYtdlpVersion();
+  console.log(`[ytdlp] analyze url=${url} binary=${bin} v${version ?? "?"}`);
 
   const cached = getCachedAnalyze(url);
   if (cached) return cached;
