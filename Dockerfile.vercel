@@ -1,18 +1,24 @@
 # Dockerfile.vercel - Vercel Container Deployment
 # Installs yt-dlp and FFmpeg inside the container for production use.
 # Local development continues to work via config.ts resolution logic.
+#
+# Base: Debian slim (NOT Alpine). Prisma 5's musl query engine links against
+# libssl.so.1.1, which modern Alpine (OpenSSL 3) no longer ships; on Debian the
+# engine resolves against OpenSSL 3.0 and loads cleanly.
 
-FROM node:22-alpine AS base
+FROM node:22-slim AS base
 
-# Install system dependencies: yt-dlp, ffmpeg, python3, ca-certificates
-RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    ffmpeg \
-    ca-certificates \
+# System dependencies: yt-dlp, ffmpeg, python3, ca-certificates
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        ffmpeg \
+        ca-certificates \
     && pip3 install --no-cache-dir --break-system-packages yt-dlp \
     && yt-dlp --version \
-    && ffmpeg -version
+    && ffmpeg -version \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -22,7 +28,11 @@ RUN npm ci
 
 # Copy source and build
 COPY . .
-RUN npm run build
+# Generate the Prisma client. "npm ci" ran before schema.prisma existed in the
+# layer (it is copied by COPY . .), so the postinstall auto-generation skipped;
+# without this, @prisma/client types are missing and the build type-check fails
+# with TS7006 implicit-any errors in src/lib/db.ts.
+RUN npx prisma generate && npm run build
 
 # Copy Next.js standalone output to app root for runtime
 # Standalone output includes: server.js, .next/ (static + server), node_modules/
@@ -31,12 +41,9 @@ RUN cp -r .next/standalone/* . && \
     cp -r .next/static .next/ && \
     cp -r public .next/ 2>/dev/null || true
 
-# Prune devDependencies for smaller production image
-RUN npm prune --production
-
 # Create non-root user for security (Vercel runs as non-root)
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nextjs -u 1001
+RUN groupadd -g 1001 nodejs && \
+    useradd -g nodejs -u 1001 -m nextjs
 
 # Create data directories with proper permissions
 RUN mkdir -p .mediavault/downloads .mediavault/temp .mediavault/thumbnails && \
