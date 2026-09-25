@@ -3,8 +3,14 @@ import { fail } from "@/lib/api";
 import { AppError } from "@/lib/errors";
 import { jobManager } from "@/lib/jobs";
 import { DOWNLOADS_DIR } from "@/lib/config";
+import {
+  fetchFromStorage,
+  fileStorageKey,
+  mimeForExt,
+} from "@/lib/storage";
 import { createReadStream, statSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
+import type { DownloadJob } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -62,6 +68,9 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
       ? join(settings.downloadPath, "mediavault")
       : DOWNLOADS_DIR;
 
+    // Check if download is forced via query param
+    const forceDownload = request.nextUrl.searchParams.get("download") === "1";
+
     // Try exact filename first
     let filePath = join(baseDir, job.fileName);
     let resolvedFile = resolve(filePath);
@@ -92,6 +101,15 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
         resolvedFile = resolve(filePath);
         console.log(`[File API] Found file via search: ${filePath}`);
       } else {
+        // Disk miss — the request may be served by an instance that never
+        // produced the file. Fall back to the Supabase Storage mirror
+        // (env-gated) before giving up.
+        const mirrored = await serveFromStorage(
+          job,
+          request.headers.get("range"),
+          forceDownload
+        );
+        if (mirrored) return mirrored;
         throw new AppError("NOT_FOUND", "File not found on disk");
       }
     }
@@ -108,7 +126,6 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
     const contentType = getContentType(ext);
 
     // Check if download is forced via query param
-    const forceDownload = request.nextUrl.searchParams.get("download") === "1";
     const disposition = forceDownload ? "attachment" : "inline";
 
     // Build Content-Disposition header with proper encoding
@@ -169,4 +186,40 @@ function getContentType(ext: string): string {
     ogg: "audio/ogg",
   };
   return types[ext] || "application/octet-stream";
+}
+
+/**
+ * Serve a file from the Supabase Storage mirror (env-gated). Returns null when
+ * the feature is off, the object is missing, or the fetch failed — callers fall
+ * through to their normal NOT_FOUND error in that case.
+ */
+async function serveFromStorage(
+  job: DownloadJob,
+  range: string | null,
+  forceDownload: boolean
+): Promise<Response | null> {
+  if (!job.fileName) return null;
+  const fetched = await fetchFromStorage(
+    fileStorageKey(job.id, job.fileName),
+    range
+  );
+  if (!fetched || fetched.status === 404 || !fetched.body) return null;
+
+  const fileName = basename(job.fileName);
+  const ext = fileName.split(".").pop()?.toLowerCase() || "";
+  const contentType = fetched.contentType ?? getContentType(ext) ?? mimeForExt(ext);
+  const disposition = forceDownload ? "attachment" : "inline";
+
+  const headers: Record<string, string> = {
+    "Content-Type": contentType,
+    "Accept-Ranges": "bytes",
+    "Content-Disposition": `${disposition}; ${encodeContentDispositionFilename(fileName)}`,
+  };
+  if (fetched.contentLength) headers["Content-Length"] = fetched.contentLength;
+  if (fetched.contentRange) headers["Content-Range"] = fetched.contentRange;
+
+  return new Response(fetched.body as unknown as ReadableStream, {
+    status: fetched.status,
+    headers,
+  });
 }

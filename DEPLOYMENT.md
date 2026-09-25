@@ -65,7 +65,11 @@ curl -s -X POST https://.../api/analyze -H "Content-Type: application/json" \
   mati, job yang sedang berjalan ikut mati (dicatat `failed` oleh reconcile
   setelah 30 menit).
 - **Storage ephemeral.** File di `/app/.mediavault` hilang saat redeploy /
-  instance di-recycle. Unduhan harus diambil (tombol download) sebelum itu.
+  instance di-recycle, dan request bisa dilayani instans yang berbeda dari
+  yang men-download. **Solusi bawaan:** aktifkan mirror Supabase Storage
+  (bagian 8) — setelah itu file hasil download tersaji permanen di
+  `GET /api/downloads/:id/file` meski lintas instans. Tanpa mirror, unduhan
+  harus diambil (tombol download) sebelum instance berganti.
 - **Durasi.** Download lama (video besar) bergantung pada umur instance;
   the instance tidak mati selama ada request — polling progress dari UI
   membuatnya tetap hidup.
@@ -86,3 +90,37 @@ curl -s -X POST https://.../api/analyze -H "Content-Type: application/json" \
   engine ikut ter-trace ke output `standalone` (tanpa ini, container boot tapi
   semua query DB gagal).
 - Runtime pakai `node server.js` (standalone) sebagai user `nextjs` non-root.
+
+## 8. (Opsional) Supabase Storage — file hasil download yang persisten
+
+Tanpa ini, file hanya ada di disk instans yang men-download (hilang saat
+instans berganti — lihat bagian 6). Dengan mirror ini, `GET
+/api/downloads/:id/file` membaca dari Supabase Storage sehingga file tetap
+tersaji lintas instans/redeploy.
+
+1. Buat bucket di dashboard/API Supabase (harus **private**; nama default
+   `mediavault`):
+   ```bash
+   curl -X POST https://<ref>.supabase.co/storage/v1/bucket \
+     -H "apikey: $SERVICE_ROLE" -H "Authorization: Bearer $SERVICE_ROLE" \
+     -H "Content-Type: application/json" \
+     -d '{"name":"mediavault","public":false}'
+   ```
+2. Set env di Vercel (production/preview/development):
+   ```bash
+   vercel env add SUPABASE_URL production
+   vercel env add SUPABASE_SERVICE_ROLE_KEY production
+   vercel env add SUPABASE_STORAGE_BUCKET production   # opsional, default mediavault
+   ```
+3. Redeploy (`vercel redeploy <url> --prod` atau push ke `main`).
+
+Perilaku:
+- File **≤ limit objek plan free (~50 MB)** di-mirror otomatis saat download
+  selesai (MP3, video kecil). Status `completed` baru ditulis **setelah**
+  mirror berhasil — jadi `completed` = file durable.
+- Video > limit tetap tersimpan di disk instans (degradasi: hanya tersaji di
+  instans yang sama). Log `[Storage] Mirror upload failed` mengindikasikan ini.
+- `DELETE /api/downloads/:id` ikut menghapus objek di bucket (idempoten).
+- Tanpa env SUPABASE_* fitur ini non-aktif (perilaku disk-only, cocok untuk
+  dev lokal). Akses file pakai service-role key dari server-side saja; browser
+  tidak pernah melihat key tersebut.

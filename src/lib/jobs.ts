@@ -24,6 +24,12 @@ import {
   sanitizeFilename,
   type DownloadOutcome,
 } from "@/lib/ytdlp";
+import {
+  deleteFromStorage,
+  fileStorageKey,
+  mirrorToStorage,
+  mimeForExt,
+} from "@/lib/storage";
 import type {
   DownloadJob,
   JobStatus,
@@ -223,7 +229,9 @@ export class JobManager {
     const job = await this.get(id);
     if (job?.fileName && job.fileName.length > 0 && !job.batchId) {
       const settings = this.settings();
-      const dir = settings.downloadPath || DOWNLOADS_DIR;
+      const dir = settings.downloadPath
+        ? join(settings.downloadPath, "mediavault")
+        : DOWNLOADS_DIR;
       const file = join(dir, job.fileName);
       if (existsSync(file)) {
         try {
@@ -232,6 +240,8 @@ export class JobManager {
           // best-effort
         }
       }
+      // Remove the storage mirror too (idempotent; 404 is fine).
+      void deleteFromStorage(fileStorageKey(id, job.fileName));
     }
     void this.closeWorkDir(id);
     this.registry.delete(id);
@@ -524,6 +534,21 @@ export class JobManager {
       } catch {
         // keep the original name if the rename races with the sweeper
       }
+    }
+
+    // Mirror the finished file to Supabase Storage (env-gated). Await before
+    // marking "completed" so the status means the file is durable, not just on
+    // this instance's ephemeral disk. Oversized objects fail here and degrade
+    // to disk-only (the API warns instead of failing the download).
+    const mirrorOk = await mirrorToStorage(
+      join(outputDir, outcome.fileName),
+      fileStorageKey(id, outcome.fileName),
+      mimeForExt(outcome.ext.toLowerCase())
+    );
+    if (!mirrorOk) {
+      console.warn(
+        `[JobManager] File mirror skipped for ${id} (keeping disk-only)`
+      );
     }
 
     await this.markStatus(id, "completed", {
