@@ -21,6 +21,9 @@ export const DOWNLOADS_DIR =
 
 export const TEMP_DIR = join(DATA_DIR, "temp");
 
+/** Cache of analyzed metadata + raw yt-dlp info dumps (survives restarts). */
+export const CACHE_DIR = join(DATA_DIR, "cache");
+
 export const THUMBNAIL_DIR = join(DATA_DIR, "thumbnails");
 
 /** Download timeout (ms). Downloads can be large; keep generous. */

@@ -1,9 +1,12 @@
-import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { readdir, rename, stat } from "node:fs/promises";
 import { AppError } from "@/lib/errors";
 import {
   ANALYZE_TIMEOUT_MS,
+  CACHE_DIR,
   DOWNLOAD_TIMEOUT_MS,
   DOWNLOADS_DIR,
   resolveFfmpegPath,
@@ -68,7 +71,9 @@ interface AnalyzeOptions {
  * the media host again. Cache entries are plain objects we already returned,
  * so this never mocks or fabricates metadata.
  */
-const ANALYZE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const ANALYZE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour — long enough to cover an active session
+/** How long persisted info dumps stay valid for the extraction-skip fast path. */
+export const ANALYZE_INFO_TTL_MS = ANALYZE_CACHE_TTL_MS;
 const ANALYZE_CACHE_MAX = 100;
 const analyzeCache = new Map<
   string,
@@ -91,6 +96,51 @@ function storeAnalyze(url: string, media: MediaInfo): void {
     if (oldest !== undefined) analyzeCache.delete(oldest);
   }
   analyzeCache.set(url, { expiresAt: Date.now() + ANALYZE_CACHE_TTL_MS, media });
+}
+
+/** Canonical URL form used as the cache key (mirrors analyzeMedia). */
+async function canonicalUrl(rawUrl: string): Promise<string> {
+  return (await assertValidUrl(rawUrl, { resolveDns: false })).toString();
+}
+
+/** On-disk path of the raw yt-dlp info dump for a URL. */
+export async function infoJsonPathFor(rawUrl: string): Promise<string> {
+  const url = await canonicalUrl(rawUrl);
+  const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+  return join(CACHE_DIR, `${hash}.info.json`);
+}
+
+/** Cached analyze hit for a URL (null on miss/expiry). */
+export async function getCachedAnalyzeForUrl(
+  rawUrl: string
+): Promise<MediaInfo | null> {
+  return getCachedAnalyze(await canonicalUrl(rawUrl));
+}
+
+/** Persist the raw yt-dlp info dump so downloads can skip re-extraction. */
+async function writeInfoJsonCache(url: string, dump: YtDump): Promise<void> {
+  try {
+    await mkdir(CACHE_DIR, { recursive: true });
+    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    await writeFile(
+      join(CACHE_DIR, `${hash}.info.json`),
+      JSON.stringify(dump),
+      "utf8"
+    );
+  } catch (err) {
+    console.error("[ytdlp] Failed to write info cache:", err);
+  }
+}
+
+/** True when a cached info dump exists for this URL and is fresh. */
+export function hasFreshInfoJson(path: string, ttlMs: number): boolean {
+  try {
+    if (!existsSync(path)) return false;
+    const { mtime } = statSync(path);
+    return Date.now() - mtime.getTime() <= ttlMs;
+  } catch {
+    return false;
+  }
 }
 
 /** Fetch full metadata + formats for a single media page. */
@@ -194,6 +244,11 @@ export async function analyzeMedia(
 
   void warnings;
   storeAnalyze(url, media);
+  // Persist the raw info dump so an imminent download with this URL can skip
+  // yt-dlp's extraction entirely (the player-API round-trip is the slow part).
+  if (Array.isArray(dump.formats) && dump.formats.length > 0) {
+    void writeInfoJsonCache(url, dump);
+  }
   return media;
 }
 
@@ -212,6 +267,12 @@ interface DownloadOptions {
   timeoutMs?: number;
   /** Progress callback throttle (ms). */
   throttleMs?: number;
+  /**
+   * Path to a previously saved yt-dlp info dump. When provided, extraction is
+   * skipped entirely and yt-dlp downloads straight from the cached streams,
+   * eliminating the player-API round-trip before the first byte.
+   */
+  infoJsonPath?: string;
 }
 
 export interface DownloadOutcome {
@@ -399,6 +460,11 @@ export async function downloadMedia(options: DownloadOptions): Promise<DownloadO
     args.push("-x");
     if (options.audioFormat) args.push("--audio-format", options.audioFormat);
     if (options.audioQuality) args.push("--audio-quality", options.audioQuality);
+  }
+
+  // Skip extraction using a previously saved info dump (fast path).
+  if (options.infoJsonPath) {
+    args.push("--load-info-json", options.infoJsonPath);
   }
 
   args.push(url);

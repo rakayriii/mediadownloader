@@ -15,8 +15,12 @@ import {
   settingsRepository,
 } from "@/lib/db";
 import {
+  ANALYZE_INFO_TTL_MS,
   analyzeMedia,
   downloadMedia,
+  getCachedAnalyzeForUrl,
+  hasFreshInfoJson,
+  infoJsonPathFor,
   sanitizeFilename,
   type DownloadOutcome,
 } from "@/lib/ytdlp";
@@ -408,38 +412,84 @@ export class JobManager {
     const formatId =
       input.formatId ?? (isAudio ? "ba/b" : settings.defaultFormat || "best");
 
-    let outcome: DownloadOutcome;
-    try {
-      outcome = await downloadMedia({
-        url: input.url,
-        formatId,
-        workDir,
-        outputDir,
-        extractAudio: isAudio,
-        audioFormat: isAudio ? settings.audioFormat : undefined,
-        audioQuality: isAudio ? settings.audioQuality : undefined,
-        signal: controller.signal,
-        throttleMs: PROGRESS_THROTTLE_MS,
-        onProgress: (progress) => {
-          const current = this.registry.get(id);
-          if (!current) return;
-          if (current.status !== "running") return;
-          current.progress = progress;
-          // registry mutation only; DB sync happens at milestones
-        },
-      });
+    // Fast path: when metadata was already supplied (the UI just analyzed the
+    // URL), reuse the persisted yt-dlp info dump to skip extraction — this is
+    // what keeps "Preparing download…" near-instant instead of a 6–8s
+    // player-API round-trip before the first progress line.
+    let infoJson: string | null = null;
+    if (!willAnalyze) {
+      try {
+        const cached = await getCachedAnalyzeForUrl(input.url);
+        if (cached && cached.formats.length > 0) {
+          const path = await infoJsonPathFor(input.url);
+          if (hasFreshInfoJson(path, ANALYZE_INFO_TTL_MS)) infoJson = path;
+        }
+      } catch {
+        infoJson = null; // any hiccup → normal extraction flow
+      }
+    }
 
+    let outcome: DownloadOutcome | undefined;
+    const attempts: Array<{ infoJsonPath?: string }> = infoJson
+      ? [{ infoJsonPath: infoJson }, {}]
+      : [{}];
+    let lastError: AppError | null = null;
+    for (const attempt of attempts) {
       if (controller.signal.aborted) {
         await this.markCancelled(id);
         return;
       }
-    } catch (err) {
-      if (controller.signal.aborted) {
-        await this.markCancelled(id);
-        return;
+      try {
+        outcome = await downloadMedia({
+          url: input.url,
+          formatId,
+          workDir,
+          outputDir,
+          extractAudio: isAudio,
+          audioFormat: isAudio ? settings.audioFormat : undefined,
+          audioQuality: isAudio ? settings.audioQuality : undefined,
+          signal: controller.signal,
+          throttleMs: PROGRESS_THROTTLE_MS,
+          infoJsonPath: attempt.infoJsonPath,
+          onProgress: (progress) => {
+            const current = this.registry.get(id);
+            if (!current) return;
+            if (current.status !== "running") return;
+            current.progress = progress;
+            // registry mutation only; DB sync happens at milestones
+          },
+        });
+        break;
+      } catch (err) {
+        if (controller.signal.aborted) {
+          await this.markCancelled(id);
+          return;
+        }
+        lastError = toAppError(err);
+        // Only the extraction-skip fast path is retried; a genuinely failing
+        // download (cached streams may have expired) is fatal after retry.
+        if (lastError.code !== "DOWNLOAD_ERROR" || !attempt.infoJsonPath) {
+          await this.markFailed(
+            id,
+            lastError.code,
+            lastError.message,
+            lastError.details
+          );
+          return;
+        }
+        console.warn(
+          `[JobManager] Extraction-skip failed for ${id}, retrying with fresh extraction: ${lastError.message}`
+        );
       }
-      const appError = toAppError(err);
-      await this.markFailed(id, appError.code, appError.message, appError.details);
+    }
+
+    if (controller.signal.aborted) {
+      await this.markCancelled(id);
+      return;
+    }
+    if (!outcome) return;
+    if (lastError) {
+      await this.markFailed(id, lastError.code, lastError.message, lastError.details);
       return;
     }
 

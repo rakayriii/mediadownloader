@@ -166,10 +166,21 @@ export const downloadRepository = {
     return { changes: result.count };
   },
 
-  /** Mark orphaned queued/running rows (left by a crashed process) as failed. */
+  /**
+   * Mark orphaned queued/running rows (left by a crashed process) as failed.
+   * Only rows created more than STALE_AFTER_MS ago are touched, so a fresh job
+   * — or one owned by a live process in a parallel/reboot scenario — is never
+   * torn down while it is still making progress.
+   */
   async failStaleJobs(message: string): Promise<number> {
+    const staleBefore = new Date(
+      Date.now() - (Number(process.env.MEDIAVAULT_STALE_JOB_MS) || 30 * 60 * 1000)
+    );
     const result = await prisma.download.updateMany({
-      where: { status: { in: ["queued", "running"] } },
+      where: {
+        status: { in: ["queued", "running"] },
+        createdAt: { lt: staleBefore },
+      },
       data: {
         status: "failed",
         error: message,
