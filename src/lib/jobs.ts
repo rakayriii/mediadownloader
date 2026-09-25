@@ -21,8 +21,6 @@ import {
   type DownloadOutcome,
 } from "@/lib/ytdlp";
 import type {
-  BatchJob,
-  BatchStatus,
   DownloadJob,
   JobStatus,
   JobType,
@@ -67,6 +65,28 @@ export class JobManager {
 
   constructor() {
     this.maxConcurrency = this.readConcurrency();
+    // Mark queued/running rows from a previously crashed process as failed,
+    // otherwise the history fills up with jobs that will never run again.
+    void this.reconcileStaleJobs();
+  }
+
+  /**
+   * The in-memory queue owns live jobs, so anything left in `queued`/`running`
+   * in the database belongs to a process that no longer exists. This runs on a
+   * single instance; a container deployment that restarts will converge any
+   * orphaned rows to `failed` instead of leaving permanent zombies.
+   */
+  private async reconcileStaleJobs(): Promise<void> {
+    try {
+      const count = await downloadRepository.failStaleJobs(
+        "Server restarted before this job finished. Retry to download again."
+      );
+      if (count > 0) {
+        console.log(`[JobManager] Marked ${count} stale job(s) as failed`);
+      }
+    } catch (err) {
+      console.error("[JobManager] Failed to reconcile stale jobs:", err);
+    }
   }
 
   private readConcurrency(): number {
@@ -101,8 +121,8 @@ export class JobManager {
     return [...liveOnly, ...rowsWithLive].slice(0, 200);
   }
 
-  /** Create and enqueue a download job; returns immediately. */
-  create(input: CreateDownloadInput): DownloadJob {
+  /** Create and enqueue a download job. Returns once the job is persisted. */
+  async create(input: CreateDownloadInput): Promise<DownloadJob> {
     const id = randomUUID();
     const now = new Date().toISOString();
     const job: DownloadJob = {
@@ -125,10 +145,13 @@ export class JobManager {
 
     this.registry.set(id, job);
     if (this.settings().keepHistory) {
-      // Fire and forget - don't block job creation
-      downloadRepository.insert(job).catch((err) => {
+      // Persist BEFORE enqueueing so the job's first status update (running)
+      // can never race a missing row. Failures are logged, not fatal.
+      try {
+        await downloadRepository.insert(job);
+      } catch (err) {
         console.error("[JobManager] Failed to persist new job:", err);
-      });
+      }
     }
 
     this.enqueue(async () => {
@@ -170,7 +193,7 @@ export class JobManager {
       startedAt: null,
     };
     this.registry.set(id, reset);
-    await downloadRepository.update(reset);
+    await this.persist(reset);
 
     this.enqueue(async () => {
       await this.runJob(id, {
@@ -219,6 +242,16 @@ export class JobManager {
     }
   }
 
+  /** Best-effort persistence: the in-memory registry stays authoritative, so a
+   *  missing row (e.g. keepHistory=false) must never tear down the live job. */
+  private async persist(next: DownloadJob): Promise<void> {
+    try {
+      await downloadRepository.update(next);
+    } catch (err) {
+      console.error(`[JobManager] Failed to persist status for ${next.id}:`, err);
+    }
+  }
+
   private async markStatus(
     id: string,
     status: JobStatus,
@@ -237,14 +270,14 @@ export class JobManager {
     if (status === "completed" || status === "failed" || status === "cancelled") {
       next.completedAt = new Date().toISOString();
       this.registry.set(id, next);
-      await downloadRepository.update(next);
+      await this.persist(next);
       void this.closeWorkDir(id);
       await this.signalBatchItem(id, status);
       this.abortControllers.delete(id);
       return;
     }
     this.registry.set(id, next);
-    await downloadRepository.update(next);
+    await this.persist(next);
   }
 
   private async markCancelled(id: string): Promise<void> {
@@ -260,7 +293,7 @@ export class JobManager {
       progress: { stage: "queued", message: "Cancelled" },
     };
     this.registry.set(id, next);
-    await downloadRepository.update(next);
+    await this.persist(next);
     await this.signalBatchItem(id, "cancelled");
     this.abortControllers.delete(id);
   }
@@ -286,7 +319,9 @@ export class JobManager {
       if (!task) break;
       this.active += 1;
       void task()
-        .catch(() => undefined)
+        .catch((err) => {
+          console.error("[JobManager] Queue task failed:", err);
+        })
         .finally(() => {
           this.active -= 1;
           this.pump();
@@ -321,12 +356,14 @@ export class JobManager {
       return;
     }
 
+    // Re-analyze only when the caller didn't pass metadata (batch/audio flows).
+    const willAnalyze = !input.title;
     await this.markStatus(id, "running", {
-      progress: { stage: "analyzing", message: "Fetching media metadata…" },
+      progress: willAnalyze
+        ? { stage: "analyzing", message: "Fetching media metadata…" }
+        : { stage: "downloading", message: "Preparing download…" },
       startedAt: new Date().toISOString(),
     });
-
-    // Re-analyze when the caller didn't pass metadata (batch/audio flows).
     let meta = {
       title: input.title,
       uploader: input.uploader,
@@ -467,8 +504,7 @@ export class JobManager {
   private async signalBatchItem(jobId: string, status: JobStatus): Promise<void> {
     const job = await this.get(jobId);
     if (!job?.batchId) return;
-    const batchId = job.batchId;
-    const batch = await batchRepository.get(batchId);
+    const batch = await batchRepository.get(job.batchId);
     if (!batch) return;
 
     const item = batch.items.find((i) => i.jobId === jobId);
@@ -480,26 +516,10 @@ export class JobManager {
         : status === "cancelled"
           ? "cancelled"
           : "failed";
-    await batchRepository.updateItem({ id: item.id, status: itemStatus });
-
-    const updated = await batchRepository.get(batchId);
-    if (!updated) return;
-    const counts = updated.counts;
-    const done = counts.completed + counts.failed + counts.cancelled;
-    const nextStatus: BatchStatus =
-      done >= counts.total
-        ? counts.failed === 0 && counts.cancelled === 0
-          ? "completed"
-          : counts.completed === 0 && counts.failed > 0
-            ? "failed"
-            : "partial"
-        : "running";
-    const patch: BatchJob = {
-      ...updated,
-      status: nextStatus,
-      completedAt: done >= counts.total ? new Date().toISOString() : updated.completedAt,
-    };
-    await batchRepository.update(patch);
+    await batchRepository.updateItem({ id: item.id, status: itemStatus, jobId });
+    // Recompute counters from the item rows — the source of truth — so the
+    // batch reaches "completed"/"partial" instead of staying "running".
+    await batchRepository.recount(job.batchId);
   }
 }
 

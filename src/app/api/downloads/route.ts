@@ -8,7 +8,6 @@ import type { JobType } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-const VALID_TYPES: JobType[] = ["video", "audio"];
 const VALID_AUDIO_FORMATS = ["mp3", "m4a", "opus", "wav", "aac", "flac", "vorbis"];
 
 interface CreateDownloadBody {
@@ -81,7 +80,7 @@ export async function POST(request: NextRequest) {
       throw new AppError("INVALID_INPUT", "duration must be a number");
     }
 
-    const job = jobManager.create({
+    const job = await jobManager.create({
       url,
       type,
       formatId,
@@ -126,15 +125,9 @@ export async function GET(request: NextRequest) {
       offset: (page - 1) * pageSize,
     });
 
-    const items = result.items.map((row) => {
-      const live = jobManager.get(row.id);
-      // Note: jobManager.get is now async, but we can't await in map
-      // The live job from registry will have progress info
-      // For now, return row as-is since live progress is handled separately
-      return row;
-    });
-
-    return ok({ items, total: result.total, page, pageSize });
+    // jobManager.list() merges live registry progress with DB rows, and each
+    // row here comes straight from PostgreSQL — the persistent source of truth.
+    return ok({ items: result.items, total: result.total, page, pageSize });
   } catch (err) {
     return fail(err);
   }

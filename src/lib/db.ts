@@ -160,10 +160,24 @@ export const downloadRepository = {
   },
 
   async delete(id: string): Promise<{ changes: number }> {
-    const result = await prisma.download.delete({
+    const result = await prisma.download.deleteMany({
       where: { id },
     });
-    return { changes: result ? 1 : 0 };
+    return { changes: result.count };
+  },
+
+  /** Mark orphaned queued/running rows (left by a crashed process) as failed. */
+  async failStaleJobs(message: string): Promise<number> {
+    const result = await prisma.download.updateMany({
+      where: { status: { in: ["queued", "running"] } },
+      data: {
+        status: "failed",
+        error: message,
+        errorCode: "DOWNLOAD_ERROR",
+        completedAt: new Date(),
+      },
+    });
+    return result.count;
   },
 };
 
@@ -290,6 +304,51 @@ export const batchRepository = {
     });
   },
 
+  /** Recompute a batch's counters + status from its actual item rows. */
+  async recount(batchId: string): Promise<BatchJob | null> {
+    const [grouped, row] = await Promise.all([
+      prisma.batchItem.groupBy({
+        by: ["status"],
+        where: { batchId },
+        _count: { _all: true },
+      }),
+      prisma.batch.findUnique({ where: { id: batchId } }),
+    ]);
+    if (!row) return null;
+
+    const countFor = (s: string) =>
+      grouped.find((g) => g.status === s)?._count._all ?? 0;
+    const completed = countFor("completed");
+    const failed = countFor("failed");
+    const cancelled = countFor("cancelled");
+    const running = countFor("running");
+    const queued = countFor("queued");
+    const total = completed + failed + cancelled + running + queued;
+    const done = completed + failed + cancelled;
+
+    const status: BatchStatus =
+      done >= total
+        ? failed === 0 && cancelled === 0
+          ? "completed"
+          : completed === 0 && failed > 0
+            ? "failed"
+            : "partial"
+        : "running";
+
+    await prisma.batch.update({
+      where: { id: batchId },
+      data: {
+        status,
+        completed,
+        failed,
+        cancelled,
+        completedAt:
+          done >= total ? (row.completedAt ?? new Date()) : null,
+      },
+    });
+    return this.get(batchId);
+  },
+
   async delete(id: string): Promise<void> {
     await prisma.batch.delete({ where: { id } });
   },
@@ -337,45 +396,23 @@ export const settingsRepository = {
     return DEFAULT_SETTINGS;
   },
 
-  async setAll(settings: AppSettings): Promise<void> {
+  async setAll(settings: Partial<AppSettings>): Promise<void> {
+    // Merge with the current values so absent keys keep their persisted value
+    // (the client only sends the fields the user changed).
+    const current = await settingsRepository.getAll();
+    const merged: AppSettings = { ...current, ...settings };
     settingsCache = null;
     settingsCachePromise = null;
     await prisma.$transaction(async (tx) => {
-      await tx.setting.upsert({
-        where: { key: "downloadPath" },
-        create: { key: "downloadPath", value: settings.downloadPath },
-        update: { value: settings.downloadPath },
-      });
-      await tx.setting.upsert({
-        where: { key: "defaultFormat" },
-        create: { key: "defaultFormat", value: settings.defaultFormat },
-        update: { value: settings.defaultFormat },
-      });
-      await tx.setting.upsert({
-        where: { key: "concurrency" },
-        create: { key: "concurrency", value: String(settings.concurrency) },
-        update: { value: String(settings.concurrency) },
-      });
-      await tx.setting.upsert({
-        where: { key: "keepHistory" },
-        create: { key: "keepHistory", value: String(settings.keepHistory) },
-        update: { value: String(settings.keepHistory) },
-      });
-      await tx.setting.upsert({
-        where: { key: "audioFormat" },
-        create: { key: "audioFormat", value: settings.audioFormat },
-        update: { value: settings.audioFormat },
-      });
-      await tx.setting.upsert({
-        where: { key: "audioQuality" },
-        create: { key: "audioQuality", value: settings.audioQuality },
-        update: { value: settings.audioQuality },
-      });
-      await tx.setting.upsert({
-        where: { key: "ytdlpPath" },
-        create: { key: "ytdlpPath", value: settings.ytdlpPath },
-        update: { value: settings.ytdlpPath },
-      });
+      for (const [key, value] of Object.entries(merged) as Array<
+        [keyof AppSettings, AppSettings[keyof AppSettings]]
+      >) {
+        await tx.setting.upsert({
+          where: { key },
+          create: { key, value: String(value) },
+          update: { value: String(value) },
+        });
+      }
     });
   },
 };

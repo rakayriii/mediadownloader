@@ -28,12 +28,12 @@ export async function GET(_request: NextRequest, ctx: RouteParams) {
  * DELETE /api/downloads/[id]
  * Cancel a running job (if any) and remove the history entry + output file.
  * The database DELETE must complete before returning a successful response.
+ * Idempotent: deleting an already-deleted job succeeds.
  */
 export async function DELETE(_request: NextRequest, ctx: RouteParams) {
   try {
     const { id } = await ctx.params;
-    const job = await jobManager.get(id);
-    if (!job) throw new AppError("NOT_FOUND", "Download job not found");
+    // Directly call remove - it's idempotent and handles missing jobs gracefully
     await jobManager.remove(id);
     return ok({ deleted: true });
   } catch (err) {

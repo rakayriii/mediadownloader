@@ -89,7 +89,7 @@ export async function createBatch(urlsRaw: string[]): Promise<CreateBatchResult>
 
   // Enqueue child jobs — each links back to the batch and its item.
   for (const { item, meta } of valid) {
-    const job = jobManager.create({
+    const job = await jobManager.create({
       url: meta.url,
       type: "video",
       formatId: undefined,

@@ -73,7 +73,7 @@ export async function POST(request: NextRequest) {
       throw new AppError("INVALID_INPUT", "keepHistory must be a boolean");
     }
 
-    await settingsRepository.setAll(body as AppSettings);
+    await settingsRepository.setAll(body);
     const settings = await settingsRepository.getAll();
 
     return ok({ settings });

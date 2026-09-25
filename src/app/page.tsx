@@ -42,6 +42,12 @@ export default function Home() {
           url: media.webpageUrl || media.url,
           type,
           formatId: selectedFormatId,
+          // Pass the metadata we already fetched so the job does not
+          // re-run the slow yt-dlp metadata extraction again.
+          title: media.title,
+          uploader: media.uploader,
+          thumbnail: media.thumbnail,
+          duration: media.duration,
         }),
       });
 
@@ -96,7 +102,7 @@ export default function Home() {
           </div>
         </header>
 
-        <main className="flex-1 max-w-6xl mx-auto w-full p-3 sm:p-4 md:p-6 space-y-4 sm:space-y-6">
+        <main className="flex-1 max-w-6xl mx-auto w-full p-4 sm:p-6 md:p-8 lg:p-10 space-y-4 sm:space-y-6">
           <TabsContent value="download">
             <div className="space-y-4 sm:space-y-6">
               <UrlAnalyzer onAnalyze={handleAnalyze} type={type} onTypeChange={setType} />

@@ -1,35 +1,45 @@
 @import "tailwindcss";
 
+/*
+ * MediaVault theme — follows DESIGN.md ("Minimalist SaaS Dark").
+ * Deep near-black base, charcoals for surfaces/borders, cyan→blue accent,
+ * Geist for headlines and Inter for body copy.
+ */
+
 :root {
-  --background: #121318;
-  --foreground: #e3e1e9;
+  /* Background (Layer 0) */
+  --background: #090a0f;
+  --foreground: #f3f4f6;
 
-  --surface: #121318;
-  --surface-dim: #121318;
-  --surface-bright: #38393f;
-  --surface-container-lowest: #0d0e13;
-  --surface-container-low: #1a1b21;
-  --surface-container: #1e1f25;
-  --surface-container-high: #292a2f;
-  --surface-container-highest: #34343a;
-  --on-surface: #e3e1e9;
-  --on-surface-variant: #bcc9cd;
+  /* Surfaces — Layer 1 (#12141c) cards/containers, Layer 2 (#1a1d26) elevated */
+  --surface: #12141c;
+  --surface-dim: #090a0f;
+  --surface-bright: #1a1d26;
+  --surface-container-lowest: #0b0c12;
+  --surface-container-low: #12141c;
+  --surface-container: #12141c;
+  --surface-container-high: #1a1d26;
+  --surface-container-highest: #1f232c;
+  --on-surface: #f3f4f6;
+  --on-surface-variant: #9ca3af;
 
-  --primary: #4cd7f6;
+  /* Accent — cyan → blue gradient (primary CTAs, active states) */
+  --primary: #06b6d4;
   --on-primary: #003640;
   --primary-container: #06b6d4;
-  --on-primary-container: #00424f;
+  --on-primary-container: #003640;
+  --secondary: #3b82f6;
+  --on-secondary: #f8fafc;
+  --secondary-container: #2563eb;
+  --on-secondary-container: #f8fafc;
 
-  --secondary: #adc6ff;
-  --on-secondary: #002e6a;
-  --secondary-container: #0566d9;
-  --on-secondary-container: #e6ecff;
-
+  /* Tertiary (sparingly used) */
   --tertiary: #c4c6d2;
   --on-tertiary: #2d303a;
-  --tertiary-container: #a4a6b2;
-  --on-tertiary-container: #393c46;
+  --tertiary-container: #4b505c;
+  --on-tertiary-container: #e3e1e9;
 
+  /* Status */
   --error: #ffb4ab;
   --on-error: #690005;
   --error-container: #93000a;
@@ -45,13 +55,15 @@
   --warning-container: #d9a400;
   --on-warning-container: #533c00;
 
-  --outline: #869397;
-  --outline-variant: #3d494c;
+  /* Borders — crisp 1px structural lines */
+  --outline: #262b38;
+  --outline-variant: #262b38;
 
+  /* Minimal ambient shadows, applied only to floating elements */
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.3);
-  --shadow-3: 0 4px 8px rgba(0, 0, 0, 0.3);
-  --shadow-4: 0 8px 16px rgba(0, 0, 0, 0.4);
+  --shadow-3: 0 4px 8px rgba(0, 0, 0, 0.35);
+  --shadow-4: 0 4px 12px rgba(0, 0, 0, 0.4);
 }
 
 @theme inline {
@@ -104,6 +116,7 @@
 
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --font-body: var(--font-inter);
 
   --radius-sm: 0.125rem;
   --radius-md: 0.25rem;
@@ -126,7 +139,7 @@
   body {
     background-color: var(--background);
     color: var(--foreground);
-    font-family: var(--font-sans), system-ui, sans-serif;
+    font-family: var(--font-body), system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
@@ -146,12 +159,12 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    background: var(--outline-variant);
+    background: var(--outline);
     border-radius: 4px;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    background: var(--outline);
+    background: var(--on-surface-variant);
   }
 
   ::-webkit-scrollbar-corner {
@@ -160,6 +173,7 @@
 }
 
 @layer utilities {
+  /* Headlines — Geist */
   .text-headline-xl {
     font-family: var(--font-sans);
     font-size: 36px;
@@ -192,36 +206,46 @@
     letter-spacing: -0.01em;
   }
 
+  /* Body — Inter */
   .text-body-lg {
-    font-family: var(--font-sans);
+    font-family: var(--font-body);
     font-size: 16px;
     font-weight: 400;
     line-height: 24px;
   }
 
   .text-body-md {
-    font-family: var(--font-sans);
+    font-family: var(--font-body);
     font-size: 14px;
     font-weight: 400;
     line-height: 20px;
   }
 
   .text-body-sm {
-    font-family: var(--font-sans);
+    font-family: var(--font-body);
     font-size: 13px;
     font-weight: 400;
     line-height: 18px;
   }
 
   .text-body-xs {
-    font-family: var(--font-sans);
+    font-family: var(--font-body);
     font-size: 12px;
     font-weight: 400;
     line-height: 16px;
   }
 
+  /* Labels — Inter (dense metadata, tab labels, section headings) */
+  .text-label-lg {
+    font-family: var(--font-body);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 18px;
+    letter-spacing: -0.005em;
+  }
+
   .text-label-md {
-    font-family: var(--font-sans);
+    font-family: var(--font-body);
     font-size: 12px;
     font-weight: 500;
     line-height: 16px;
@@ -229,7 +253,7 @@
   }
 
   .text-label-sm {
-    font-family: var(--font-sans);
+    font-family: var(--font-body);
     font-size: 11px;
     font-weight: 500;
     line-height: 14px;

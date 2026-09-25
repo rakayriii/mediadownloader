@@ -75,7 +75,7 @@ export function TabsTrigger({ value, children, disabled = false, className = "" 
         focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 focus:ring-offset-surface
         disabled:opacity-50 disabled:cursor-not-allowed
         ${isActive
-          ? "bg-surface text-on-surface shadow-sm"
+          ? "bg-surface-container-high text-on-surface shadow-sm"
           : "text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high"}
         ${className}
       `}

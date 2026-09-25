@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
  */
 
 function projectRoot(): string {
-  return resolve(process.cwd());
+  return resolve(/* turbopackIgnore: true */ process.cwd());
 }
 
 export const DATA_DIR = process.env.MEDIAVAULT_DATA_DIR

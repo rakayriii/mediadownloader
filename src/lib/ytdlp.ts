@@ -61,19 +61,58 @@ interface AnalyzeOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Short-TTL in-memory cache for analyze results (keyed by resolved URL).
+ * Real results are cached briefly so re-analyzing the same link (common when
+ * the user tweaks settings or redownloads) is instant instead of waiting on
+ * the media host again. Cache entries are plain objects we already returned,
+ * so this never mocks or fabricates metadata.
+ */
+const ANALYZE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const ANALYZE_CACHE_MAX = 100;
+const analyzeCache = new Map<
+  string,
+  { expiresAt: number; media: MediaInfo }
+>();
+
+function getCachedAnalyze(url: string): MediaInfo | null {
+  const hit = analyzeCache.get(url);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    analyzeCache.delete(url);
+    return null;
+  }
+  return hit.media;
+}
+
+function storeAnalyze(url: string, media: MediaInfo): void {
+  if (analyzeCache.size >= ANALYZE_CACHE_MAX) {
+    const oldest = analyzeCache.keys().next().value;
+    if (oldest !== undefined) analyzeCache.delete(oldest);
+  }
+  analyzeCache.set(url, { expiresAt: Date.now() + ANALYZE_CACHE_TTL_MS, media });
+}
+
 /** Fetch full metadata + formats for a single media page. */
 export async function analyzeMedia(
   rawUrl: string,
   options: AnalyzeOptions = {}
 ): Promise<MediaInfo> {
   const bin = requireBinary();
-  const url = (await assertValidUrl(rawUrl)).toString();
+  // Skip DNS resolution for analysis - yt-dlp does its own validation
+  const url = (await assertValidUrl(rawUrl, { resolveDns: false })).toString();
+
+  const cached = getCachedAnalyze(url);
+  if (cached) return cached;
 
   const args = [
     "-J",
     "--no-playlist",
     "--skip-download",
     "--no-warnings",
+    // Skip per-format URL probing: returns the same format list without
+    // spending a HEAD request on every stream URL. Saves ~1s on large lists.
+    "--no-check-formats",
     "--socket-timeout",
     "30",
     url,
@@ -154,6 +193,7 @@ export async function analyzeMedia(
   };
 
   void warnings;
+  storeAnalyze(url, media);
   return media;
 }
 
