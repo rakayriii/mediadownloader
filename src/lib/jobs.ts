@@ -233,6 +233,7 @@ export class JobManager {
         }
       }
     }
+    void this.closeWorkDir(id);
     this.registry.delete(id);
     this.abortControllers.delete(id);
     try {
@@ -430,6 +431,7 @@ export class JobManager {
     }
 
     let outcome: DownloadOutcome | undefined;
+    let lastLivePersist = 0;
     const attempts: Array<{ infoJsonPath?: string }> = infoJson
       ? [{ infoJsonPath: infoJson }, {}]
       : [{}];
@@ -456,7 +458,14 @@ export class JobManager {
             if (!current) return;
             if (current.status !== "running") return;
             current.progress = progress;
-            // registry mutation only; DB sync happens at milestones
+            // Cross-process visibility: persist a throttled snapshot of live
+            // progress so polls served by another process (or a reloaded
+            // registry) never look frozen at an old milestone.
+            const now = Date.now();
+            if (now - lastLivePersist >= 2000) {
+              lastLivePersist = now;
+              void this.persist({ ...current, progress });
+            }
           },
         });
         break;
@@ -494,12 +503,24 @@ export class JobManager {
     }
 
     const fileName = sanitizeFilename(`${title}.${outcome.ext}`);
-    // Rename to the sanitized final file name if different.
+    // Rename to the sanitized final file name if different AND the target
+    // name is not already taken — two downloads of the same video must never
+    // overwrite each other (keep the yt-dlp "[id]" disambiguator instead).
     if (fileName !== outcome.fileName) {
       try {
-        const { rename } = await import("node:fs/promises");
-        await rename(join(outputDir, outcome.fileName), join(outputDir, fileName));
-        outcome = { ...outcome, fileName };
+        const fsPromises = await import("node:fs/promises");
+        const target = join(outputDir, fileName);
+        const taken = await fsPromises
+          .stat(target)
+          .then(() => true)
+          .catch(() => false);
+        if (!taken) {
+          await fsPromises.rename(
+            join(outputDir, outcome.fileName),
+            target
+          );
+          outcome = { ...outcome, fileName };
+        }
       } catch {
         // keep the original name if the rename races with the sweeper
       }
@@ -547,6 +568,7 @@ export class JobManager {
     await downloadRepository.update(next);
     await this.signalBatchItem(id, "failed");
     this.abortControllers.delete(id);
+    void this.closeWorkDir(id);
   }
 
   // ---------------------------------------------------------------- batches

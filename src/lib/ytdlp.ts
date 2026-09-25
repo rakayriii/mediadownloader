@@ -333,18 +333,19 @@ function resolveProgress(
     if (line.startsWith(PROGRESS_MARKER)) {
       const body = line.slice(PROGRESS_MARKER.length);
       const [status, percent, speed, eta, downloaded, total] = body.split("|");
+      const pct = parsePercent(percent);
+      // A "downloading" line at 100% means the stream is complete (or yt-dlp
+      // capped the estimate) — show it as wrapping up, never as a frozen bar.
+      const finished = status === "finished" || pct === 100;
       const parsed: JobProgress = {
-        stage: status === "downloading" ? "downloading" : "finalizing",
-        message: status === "finished" ? "Finalizing…" : undefined,
-        percent: parsePercent(percent),
+        stage: finished ? "finalizing" : "downloading",
+        message: finished ? "Finalizing…" : undefined,
+        percent: pct,
         speed: cleanField(speed),
         eta: cleanField(eta),
         downloadedBytes: toBytes(downloaded),
         totalBytes: toBytes(total),
       };
-      if (status === "finished" && parsed.percent === undefined) {
-        parsed.percent = 100;
-      }
       push(parsed);
       return;
     }
@@ -364,7 +365,13 @@ function resolveProgress(
       latest = {
         ...latest,
         stage,
-        message: message ?? (stage === "downloading" ? "Downloading…" : stage),
+        message:
+          message ??
+          (stage === "downloading"
+            ? "Downloading…"
+            : stage === "processing"
+              ? "Processing audio/video…"
+              : "Finalizing…"),
       };
     },
   };
