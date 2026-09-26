@@ -1,93 +1,18 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DATABASE_PATH } from "@/lib/config";
+import { prisma } from "@/lib/prisma";
 import type {
   AppSettings,
   BatchJob,
   BatchStatus,
   BatchItemStatus,
   DownloadJob,
+  ExecutionMode,
   JobStatus,
 } from "@/lib/types";
 
 /**
- * Persistent storage backed by SQLite (node:sqlite — zero native deps).
- * Schema is created on first use; WAL mode keeps reads non-blocking.
+ * Persistent storage backed by PostgreSQL via Prisma.
+ * Replaces the previous SQLite implementation.
  */
-
-let db: DatabaseSync | null = null;
-
-export function getDb(): DatabaseSync {
-  if (db) return db;
-  mkdirSync(dirname(DATABASE_PATH), { recursive: true });
-  const instance = new DatabaseSync(DATABASE_PATH);
-  instance.exec("PRAGMA journal_mode = WAL;");
-  instance.exec("PRAGMA busy_timeout = 5000;");
-  instance.exec("PRAGMA foreign_keys = ON;");
-  migrate(instance);
-  db = instance;
-  return db;
-}
-
-export function migrate(database: DatabaseSync): void {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS downloads (
-      id TEXT PRIMARY KEY,
-      type TEXT NOT NULL CHECK (type IN ('video','audio')),
-      url TEXT NOT NULL,
-      title TEXT,
-      uploader TEXT,
-      thumbnail TEXT,
-      duration INTEGER,
-      format_id TEXT,
-      ext TEXT,
-      status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','cancelled')),
-      error TEXT,
-      error_code TEXT,
-      file_name TEXT,
-      size_bytes INTEGER,
-      batch_id TEXT,
-      created_at TEXT NOT NULL,
-      started_at TEXT,
-      completed_at TEXT
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads (created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads (status);
-    CREATE INDEX IF NOT EXISTS idx_downloads_title ON downloads (title);
-    CREATE INDEX IF NOT EXISTS idx_downloads_batch ON downloads (batch_id);
-
-    CREATE TABLE IF NOT EXISTS batches (
-      id TEXT PRIMARY KEY,
-      status TEXT NOT NULL CHECK (status IN ('queued','running','completed','partial','failed','cancelled')),
-      total INTEGER NOT NULL,
-      completed INTEGER NOT NULL DEFAULT 0,
-      failed INTEGER NOT NULL DEFAULT 0,
-      cancelled INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      completed_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS batch_items (
-      id TEXT PRIMARY KEY,
-      batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
-      position INTEGER NOT NULL,
-      url TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','cancelled')),
-      error TEXT,
-      job_id TEXT,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON batch_items (batch_id, position);
-
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-  `);
-}
 
 type DownloadRow = {
   id: string;
@@ -97,17 +22,19 @@ type DownloadRow = {
   uploader: string | null;
   thumbnail: string | null;
   duration: number | null;
-  format_id: string | null;
+  formatId: string | null;
   ext: string | null;
   status: string;
   error: string | null;
-  error_code: string | null;
-  file_name: string | null;
-  size_bytes: number | null;
-  batch_id: string | null;
-  created_at: string;
-  started_at: string | null;
-  completed_at: string | null;
+  errorCode: string | null;
+  fileName: string | null;
+  sizeBytes: bigint | null;
+  batchId: string | null;
+  executor: string | null;
+  handoffError: string | null;
+  createdAt: Date;
+  startedAt: Date | null;
+  completedAt: Date | null;
 };
 
 function rowToDownload(row: DownloadRow): DownloadJob {
@@ -119,18 +46,20 @@ function rowToDownload(row: DownloadRow): DownloadJob {
     uploader: row.uploader,
     thumbnail: row.thumbnail,
     duration: row.duration,
-    formatId: row.format_id ?? undefined,
+    formatId: row.formatId ?? undefined,
     ext: row.ext,
     status: row.status as DownloadJob["status"],
     progress: null,
     error: row.error,
-    errorCode: (row.error_code as DownloadJob["errorCode"]) ?? null,
-    fileName: row.file_name,
-    sizeBytes: row.size_bytes,
-    batchId: row.batch_id,
-    createdAt: row.created_at,
-    startedAt: row.started_at,
-    completedAt: row.completed_at,
+    errorCode: (row.errorCode as DownloadJob["errorCode"]) ?? null,
+    fileName: row.fileName,
+    sizeBytes: row.sizeBytes ? Number(row.sizeBytes) : null,
+    batchId: row.batchId,
+    executor: (row.executor as DownloadJob["executor"]) ?? undefined,
+    handoffError: row.handoffError,
+    createdAt: row.createdAt.toISOString(),
+    startedAt: row.startedAt?.toISOString() ?? null,
+    completedAt: row.completedAt?.toISOString() ?? null,
   };
 }
 
@@ -147,158 +76,174 @@ export interface DownloadListResult {
 }
 
 export const downloadRepository = {
-  insert(job: DownloadJob): void {
-    const stmt = getDb().prepare(`
-      INSERT INTO downloads (
-        id, type, url, title, uploader, thumbnail, duration, format_id, ext,
-        status, error, error_code, file_name, size_bytes, batch_id,
-        created_at, started_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      job.id,
-      job.type,
-      job.url,
-      job.title ?? null,
-      job.uploader ?? null,
-      job.thumbnail ?? null,
-      job.duration ?? null,
-      job.formatId ?? null,
-      job.ext ?? null,
-      job.status,
-      job.error ?? null,
-      job.errorCode ?? null,
-      job.fileName ?? null,
-      job.sizeBytes ?? null,
-      job.batchId ?? null,
-      job.createdAt,
-      job.startedAt ?? null,
-      job.completedAt ?? null
-    );
+  async insert(job: DownloadJob): Promise<void> {
+    await prisma.download.create({
+      data: {
+        id: job.id,
+        type: job.type,
+        url: job.url,
+        title: job.title ?? null,
+        uploader: job.uploader ?? null,
+        thumbnail: job.thumbnail ?? null,
+        duration: job.duration ?? null,
+        formatId: job.formatId ?? null,
+        ext: job.ext ?? null,
+        status: job.status,
+        error: job.error ?? null,
+        errorCode: job.errorCode ?? null,
+        fileName: job.fileName ?? null,
+        sizeBytes: job.sizeBytes ? BigInt(job.sizeBytes) : null,
+        batchId: job.batchId ?? null,
+        executor: job.executor ?? null,
+        handoffError: job.handoffError ?? null,
+        createdAt: new Date(job.createdAt),
+        startedAt: job.startedAt ? new Date(job.startedAt) : null,
+        completedAt: job.completedAt ? new Date(job.completedAt) : null,
+      },
+    });
   },
 
-  update(job: DownloadJob): void {
-    const stmt = getDb().prepare(`
-      UPDATE downloads SET
-        type = ?, title = ?, uploader = ?, thumbnail = ?, duration = ?,
-        format_id = ?, ext = ?, status = ?, error = ?, error_code = ?,
-        file_name = ?, size_bytes = ?, batch_id = ?, started_at = ?,
-        completed_at = ?
-      WHERE id = ?
-    `);
-    stmt.run(
-      job.type,
-      job.title ?? null,
-      job.uploader ?? null,
-      job.thumbnail ?? null,
-      job.duration ?? null,
-      job.formatId ?? null,
-      job.ext ?? null,
-      job.status,
-      job.error ?? null,
-      job.errorCode ?? null,
-      job.fileName ?? null,
-      job.sizeBytes ?? null,
-      job.batchId ?? null,
-      job.startedAt ?? null,
-      job.completedAt ?? null,
-      job.id
-    );
+  async update(job: DownloadJob): Promise<void> {
+    await prisma.download.update({
+      where: { id: job.id },
+      data: {
+        type: job.type,
+        title: job.title ?? null,
+        uploader: job.uploader ?? null,
+        thumbnail: job.thumbnail ?? null,
+        duration: job.duration ?? null,
+        formatId: job.formatId ?? null,
+        ext: job.ext ?? null,
+        status: job.status,
+        error: job.error ?? null,
+        errorCode: job.errorCode ?? null,
+        fileName: job.fileName ?? null,
+        sizeBytes: job.sizeBytes ? BigInt(job.sizeBytes) : null,
+        batchId: job.batchId ?? null,
+        executor: job.executor ?? null,
+        handoffError: job.handoffError ?? null,
+        startedAt: job.startedAt ? new Date(job.startedAt) : null,
+        completedAt: job.completedAt ? new Date(job.completedAt) : null,
+      },
+    });
   },
 
-  get(id: string): DownloadJob | null {
-    const row = getDb()
-      .prepare("SELECT * FROM downloads WHERE id = ?")
-      .get(id) as DownloadRow | undefined;
-    return row ? rowToDownload(row) : null;
+  async get(id: string): Promise<DownloadJob | null> {
+    const row = await prisma.download.findUnique({
+      where: { id },
+    });
+    return row ? rowToDownload(row as DownloadRow) : null;
   },
 
-  list(filters: DownloadFilters = {}): DownloadListResult {
-    const where: string[] = [];
-    const params: Array<string | number> = [];
+  async list(filters: DownloadFilters = {}): Promise<DownloadListResult> {
+    const where: Record<string, unknown> = {};
 
     if (filters.status) {
-      where.push("status = ?");
-      params.push(filters.status);
+      where.status = filters.status;
     }
     if (filters.search) {
-      where.push("(title LIKE ? OR url LIKE ? OR uploader LIKE ?)");
-      const like = `%${filters.search}%`;
-      params.push(like, like, like);
+      where.OR = [
+        { title: { contains: filters.search, mode: "insensitive" } },
+        { url: { contains: filters.search, mode: "insensitive" } },
+        { uploader: { contains: filters.search, mode: "insensitive" } },
+      ];
     }
 
-    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const limit = Math.min(Math.max(filters.limit ?? 50, 1), 200);
     const offset = Math.max(filters.offset ?? 0, 0);
 
-    const countRow = getDb()
-      .prepare(`SELECT COUNT(*) AS total FROM downloads ${whereSql}`)
-      .get(...params) as { total: number };
-
-    const rows = getDb()
-      .prepare(
-        `SELECT * FROM downloads ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`
-      )
-      .all(...params, limit, offset) as DownloadRow[];
+    const [items, total] = await Promise.all([
+      prisma.download.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.download.count({ where }),
+    ]);
 
     return {
-      items: rows.map(rowToDownload),
-      total: Number(countRow.total),
+      items: items.map((row) => rowToDownload(row as DownloadRow)),
+      total,
     };
   },
 
-  delete(id: string): { changes: number } {
-    const result = getDb().prepare("DELETE FROM downloads WHERE id = ?").run(id);
-    return { changes: Number(result.changes) };
+  async delete(id: string): Promise<{ changes: number }> {
+    const result = await prisma.download.deleteMany({
+      where: { id },
+    });
+    return { changes: result.count };
+  },
+
+  /**
+   * Mark orphaned queued/running rows (left by a crashed process) as failed.
+   * Only rows created more than STALE_AFTER_MS ago are touched, so a fresh job
+   * — or one owned by a live process in a parallel/reboot scenario — is never
+   * torn down while it is still making progress.
+   */
+  async failStaleJobs(message: string): Promise<number> {
+    const staleBefore = new Date(
+      Date.now() - (Number(process.env.MEDIAVAULT_STALE_JOB_MS) || 30 * 60 * 1000)
+    );
+    const result = await prisma.download.updateMany({
+      where: {
+        status: { in: ["queued", "running"] },
+        createdAt: { lt: staleBefore },
+      },
+      data: {
+        status: "failed",
+        error: message,
+        errorCode: "DOWNLOAD_ERROR",
+        completedAt: new Date(),
+      },
+    });
+    return result.count;
   },
 };
 
-export interface BatchItemRow {
+type BatchItemRow = {
   id: string;
-  batch_id: string;
+  batchId: string;
   position: number;
   url: string;
-  status: BatchItemStatus;
+  status: string;
   error: string | null;
-  job_id: string | null;
-  created_at: string;
-}
+  jobId: string | null;
+  createdAt: Date;
+};
 
 function rowToBatchItem(row: BatchItemRow) {
   return {
     id: row.id,
     url: row.url,
     position: row.position,
-    status: row.status,
+    status: row.status as BatchItemStatus,
     error: row.error,
-    jobId: row.job_id,
+    jobId: row.jobId,
   };
 }
 
-function rowToBatch(row: {
+type BatchRow = {
   id: string;
   status: string;
   total: number;
   completed: number;
   failed: number;
   cancelled: number;
-  created_at: string;
-  completed_at: string | null;
-}): BatchJob {
-  const items = (getDb()
-    .prepare(
-      "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY position ASC"
-    )
-    .all(row.id) as unknown as BatchItemRow[]).map(rowToBatchItem);
+  createdAt: Date;
+  completedAt: Date | null;
+  items: BatchItemRow[];
+};
 
-  const queued = items.filter((i) => i.status === "queued").length;
-  const running = items.filter((i) => i.status === "running").length;
+function rowToBatch(row: BatchRow): BatchJob {
+  const queued = row.items.filter((i) => i.status === "queued").length;
+  const running = row.items.filter((i) => i.status === "running").length;
 
   return {
     id: row.id,
     status: row.status as BatchStatus,
-    urls: items.map((i) => i.url),
-    items,
+    urls: row.items.map((i) => i.url),
+    items: row.items.map(rowToBatchItem),
     counts: {
       total: row.total,
       completed: row.completed,
@@ -307,92 +252,125 @@ function rowToBatch(row: {
       queued,
       cancelled: row.cancelled,
     },
-    createdAt: row.created_at,
-    completedAt: row.completed_at,
+    createdAt: row.createdAt.toISOString(),
+    completedAt: row.completedAt?.toISOString() ?? null,
   };
 }
 
 export const batchRepository = {
-  insert(batch: BatchJob, items: Array<{ id: string; url: string }>): void {
-    const database = getDb();
-    const insertBatch = database.prepare(`
-      INSERT INTO batches (id, status, total, completed, failed, cancelled, created_at, completed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insertItem = database.prepare(`
-      INSERT INTO batch_items (id, batch_id, position, url, status, error, job_id, created_at)
-      VALUES (?, ?, ?, ?, 'queued', NULL, NULL, ?)
-    `);
-    database.exec("BEGIN");
-    try {
-      insertBatch.run(
-        batch.id,
-        batch.status,
-        batch.counts.total,
-        batch.counts.completed,
-        batch.counts.failed,
-        batch.counts.cancelled,
-        batch.createdAt,
-        batch.completedAt ?? null
-      );
-      items.forEach((item, index) => {
-        insertItem.run(item.id, batch.id, index, item.url, batch.createdAt);
+  async insert(
+    batch: BatchJob,
+    items: Array<{ id: string; url: string }>
+  ): Promise<void> {
+    await prisma.$transaction(async (tx) => {
+      await tx.batch.create({
+        data: {
+          id: batch.id,
+          status: batch.status,
+          total: batch.counts.total,
+          completed: batch.counts.completed,
+          failed: batch.counts.failed,
+          cancelled: batch.counts.cancelled,
+          createdAt: new Date(batch.createdAt),
+          completedAt: batch.completedAt ? new Date(batch.completedAt) : null,
+          items: {
+            create: items.map((item, index) => ({
+              id: item.id,
+              position: index,
+              url: item.url,
+              status: "queued" as const,
+              createdAt: new Date(batch.createdAt),
+            })),
+          },
+        },
       });
-      database.exec("COMMIT");
-    } catch (err) {
-      database.exec("ROLLBACK");
-      throw err;
-    }
+    });
   },
 
-  update(batch: BatchJob): void {
-    getDb()
-      .prepare(
-        `UPDATE batches SET status = ?, completed = ?, failed = ?, cancelled = ?, completed_at = ? WHERE id = ?`
-      )
-      .run(
-        batch.status,
-        batch.counts.completed,
-        batch.counts.failed,
-        batch.counts.cancelled,
-        batch.completedAt ?? null,
-        batch.id
-      );
+  async update(batch: BatchJob): Promise<void> {
+    await prisma.batch.update({
+      where: { id: batch.id },
+      data: {
+        status: batch.status,
+        completed: batch.counts.completed,
+        failed: batch.counts.failed,
+        cancelled: batch.counts.cancelled,
+        completedAt: batch.completedAt ? new Date(batch.completedAt) : null,
+      },
+    });
   },
 
-  get(id: string): BatchJob | null {
-    const row = getDb()
-      .prepare("SELECT * FROM batches WHERE id = ?")
-      .get(id) as
-      | {
-          id: string;
-          status: string;
-          total: number;
-          completed: number;
-          failed: number;
-          cancelled: number;
-          created_at: string;
-          completed_at: string | null;
-        }
-      | undefined;
-    return row ? rowToBatch(row) : null;
+  async get(id: string): Promise<BatchJob | null> {
+    const row = await prisma.batch.findUnique({
+      where: { id },
+      include: { items: { orderBy: { position: "asc" } } },
+    });
+    return row ? rowToBatch(row as BatchRow) : null;
   },
 
-  updateItem(item: {
+  async updateItem(item: {
     id: string;
     status: string;
     error?: string | null;
     jobId?: string | null;
-  }): void {
-    getDb()
-      .prepare(
-        "UPDATE batch_items SET status = ?, error = ?, job_id = ? WHERE id = ?"
-      )
-      .run(item.status, item.error ?? null, item.jobId ?? null, item.id);
+  }): Promise<void> {
+    await prisma.batchItem.update({
+      where: { id: item.id },
+      data: {
+        status: item.status,
+        error: item.error ?? null,
+        jobId: item.jobId ?? null,
+      },
+    });
   },
 
-  delete(id: string): void {
-    getDb().prepare("DELETE FROM batches WHERE id = ?").run(id);
+  /** Recompute a batch's counters + status from its actual item rows. */
+  async recount(batchId: string): Promise<BatchJob | null> {
+    const [grouped, row] = await Promise.all([
+      prisma.batchItem.groupBy({
+        by: ["status"],
+        where: { batchId },
+        _count: { _all: true },
+      }),
+      prisma.batch.findUnique({ where: { id: batchId } }),
+    ]);
+    if (!row) return null;
+
+    const countFor = (s: string) =>
+      grouped.find((g) => g.status === s)?._count._all ?? 0;
+    const completed = countFor("completed");
+    const failed = countFor("failed");
+    const cancelled = countFor("cancelled");
+    const running = countFor("running");
+    const queued = countFor("queued");
+    const total = completed + failed + cancelled + running + queued;
+    const done = completed + failed + cancelled;
+
+    const status: BatchStatus =
+      done >= total
+        ? failed === 0 && cancelled === 0
+          ? "completed"
+          : completed === 0 && failed > 0
+            ? "failed"
+            : "partial"
+        : "running";
+
+    await prisma.batch.update({
+      where: { id: batchId },
+      data: {
+        status,
+        completed,
+        failed,
+        cancelled,
+        completedAt:
+          done >= total ? (row.completedAt ?? new Date()) : null,
+      },
+    });
+    return this.get(batchId);
+  },
+
+  async delete(id: string): Promise<void> {
+    await prisma.batch.delete({ where: { id } });
   },
 };
 
@@ -404,61 +382,80 @@ export const DEFAULT_SETTINGS: AppSettings = {
   audioFormat: "mp3",
   audioQuality: "5",
   ytdlpPath: "",
+  executionMode: "auto",
 };
+
+function parseExecutionMode(raw: string | undefined): ExecutionMode {
+  return raw === "worker" || raw === "vercel" || raw === "auto" ? raw : "auto";
+}
+
+let settingsCache: AppSettings | null = null;
+let settingsCachePromise: Promise<AppSettings> | null = null;
 
 export const settingsRepository = {
-  getAll(): AppSettings {
-    const rows = getDb()
-      .prepare("SELECT key, value FROM settings")
-      .all() as Array<{ key: string; value: string }>;
-    const map: Record<string, string> = {};
-    for (const row of rows) map[row.key] = row.value;
-    return {
-      downloadPath: map.downloadPath ?? DEFAULT_SETTINGS.downloadPath,
-      defaultFormat: map.defaultFormat ?? DEFAULT_SETTINGS.defaultFormat,
-      concurrency: Number(map.concurrency ?? DEFAULT_SETTINGS.concurrency),
-      keepHistory: (map.keepHistory ?? String(DEFAULT_SETTINGS.keepHistory)) === "true",
-      audioFormat: map.audioFormat ?? DEFAULT_SETTINGS.audioFormat,
-      audioQuality: map.audioQuality ?? DEFAULT_SETTINGS.audioQuality,
-      ytdlpPath: map.ytdlpPath ?? DEFAULT_SETTINGS.ytdlpPath,
-    };
+  async getAll(): Promise<AppSettings> {
+    if (settingsCache) return settingsCache;
+    if (settingsCachePromise) return settingsCachePromise;
+
+    settingsCachePromise = (async () => {
+      try {
+        const rows = await prisma.setting.findMany();
+        const map: Record<string, string> = {};
+        for (const row of rows) map[row.key] = row.value;
+        settingsCache = {
+          downloadPath: map.downloadPath ?? DEFAULT_SETTINGS.downloadPath,
+          defaultFormat: map.defaultFormat ?? DEFAULT_SETTINGS.defaultFormat,
+          concurrency: Number(map.concurrency ?? DEFAULT_SETTINGS.concurrency),
+          keepHistory: (map.keepHistory ?? String(DEFAULT_SETTINGS.keepHistory)) === "true",
+          audioFormat: map.audioFormat ?? DEFAULT_SETTINGS.audioFormat,
+          audioQuality: map.audioQuality ?? DEFAULT_SETTINGS.audioQuality,
+          ytdlpPath: map.ytdlpPath ?? DEFAULT_SETTINGS.ytdlpPath,
+          executionMode: parseExecutionMode(map.executionMode),
+        };
+        return settingsCache;
+      } finally {
+        // Clear the in-flight marker even on failure so a transient DB outage
+        // (e.g. the local Postgres container is down) does not wedge the
+        // settings endpoint for the rest of the process lifetime: the next
+        // call retries instead of returning this rejected promise forever.
+        settingsCachePromise = null;
+      }
+    })();
+    return settingsCachePromise;
   },
 
-  setAll(settings: AppSettings): void {
-    const database = getDb();
-    const upsert = database.prepare(`
-      INSERT INTO settings (key, value) VALUES (?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `);
-    database.exec("BEGIN");
-    try {
-      upsert.run("downloadPath", settings.downloadPath);
-      upsert.run("defaultFormat", settings.defaultFormat);
-      upsert.run("concurrency", String(settings.concurrency));
-      upsert.run("keepHistory", String(settings.keepHistory));
-      upsert.run("audioFormat", settings.audioFormat);
-      upsert.run("audioQuality", settings.audioQuality);
-      upsert.run("ytdlpPath", settings.ytdlpPath);
-      database.exec("COMMIT");
-    } catch (err) {
-      database.exec("ROLLBACK");
-      throw err;
-    }
+  getAllSync(): AppSettings {
+    if (settingsCache) return settingsCache;
+    // Fallback to defaults if not loaded yet
+    return DEFAULT_SETTINGS;
+  },
+
+  async setAll(settings: Partial<AppSettings>): Promise<void> {
+    // Merge with the current values so absent keys keep their persisted value
+    // (the client only sends the fields the user changed).
+    const current = await settingsRepository.getAll();
+    const merged: AppSettings = { ...current, ...settings };
+    settingsCache = null;
+    settingsCachePromise = null;
+    await prisma.$transaction(async (tx) => {
+      for (const [key, value] of Object.entries(merged) as Array<
+        [keyof AppSettings, AppSettings[keyof AppSettings]]
+      >) {
+        await tx.setting.upsert({
+          where: { key },
+          create: { key, value: String(value) },
+          update: { value: String(value) },
+        });
+      }
+    });
   },
 };
 
-export function listBatches(limit = 20): BatchJob[] {
-  const rows = getDb()
-    .prepare("SELECT * FROM batches ORDER BY created_at DESC LIMIT ?")
-    .all(limit) as Array<{
-    id: string;
-    status: string;
-    total: number;
-    completed: number;
-    failed: number;
-    cancelled: number;
-    created_at: string;
-    completed_at: string | null;
-  }>;
-  return rows.map(rowToBatch);
+export async function listBatches(limit = 20): Promise<BatchJob[]> {
+  const rows = await prisma.batch.findMany({
+    orderBy: { createdAt: "desc" },
+    take: limit,
+    include: { items: { orderBy: { position: "asc" } } },
+  });
+  return rows.map((row) => rowToBatch(row as BatchRow));
 }

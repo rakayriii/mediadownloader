@@ -9,19 +9,20 @@ import { join, resolve } from "node:path";
  */
 
 function projectRoot(): string {
-  return resolve(process.cwd());
+  return resolve(/* turbopackIgnore: true */ process.cwd());
 }
 
 export const DATA_DIR = process.env.MEDIAVAULT_DATA_DIR
   ? resolve(process.env.MEDIAVAULT_DATA_DIR)
   : join(projectRoot(), ".mediavault");
 
-export const DATABASE_PATH = join(DATA_DIR, "mediavault.db");
-
 export const DOWNLOADS_DIR =
   process.env.MEDIAVAULT_DOWNLOADS_DIR ?? join(DATA_DIR, "downloads");
 
 export const TEMP_DIR = join(DATA_DIR, "temp");
+
+/** Cache of analyzed metadata + raw yt-dlp info dumps (survives restarts). */
+export const CACHE_DIR = join(DATA_DIR, "cache");
 
 export const THUMBNAIL_DIR = join(DATA_DIR, "thumbnails");
 
@@ -62,6 +63,9 @@ export const SWEEP_INTERVAL_MINUTES = Number(
 /** Default concurrency for background downloads when settings are unavailable. */
 export const DEFAULT_CONCURRENCY = 2;
 
+/** PostgreSQL database URL for Prisma. */
+export const DATABASE_URL = process.env.DATABASE_URL ?? "";
+
 const KNOWN_BINARY_DIRS = [
   process.env.YTDLP_PATH,
   join(homedir(), ".local", "bin", "yt-dlp"),
@@ -87,6 +91,19 @@ export function resolveYtdlpPath(): string | null {
     }
   }
   return null;
+}
+
+/** Base URL of the optional remote download worker (API → worker). */
+export function workerUrl(): string {
+  return (process.env.WORKER_URL ?? "http://127.0.0.1:8787").replace(/\/+$/, "");
+}
+
+/**
+ * Shared secret for API ↔ worker authentication. Empty means the worker
+ * integration is disabled (worker mode unavailable, AUTO never hands off).
+ */
+export function workerSharedSecret(): string {
+  return process.env.WORKER_SHARED_SECRET?.trim() ?? "";
 }
 
 /** Locate ffmpeg; falls back to PATH lookup result. */

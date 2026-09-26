@@ -14,7 +14,7 @@ const VALID_AUDIO_FORMATS = ["mp3", "m4a", "opus", "wav", "aac", "flac", "vorbis
  */
 export async function GET() {
   try {
-    const settings = settingsRepository.getAll();
+    const settings = await settingsRepository.getAll();
     return ok({ settings });
   } catch (err) {
     return fail(err);
@@ -40,6 +40,16 @@ export async function POST(request: NextRequest) {
         throw new AppError("INVALID_INPUT", "concurrency must be an integer between 1 and 10");
       }
       body.concurrency = n;
+    }
+
+    if (
+      body.executionMode !== undefined &&
+      !["vercel", "worker", "auto"].includes(body.executionMode)
+    ) {
+      throw new AppError(
+        "INVALID_INPUT",
+        "executionMode must be 'vercel', 'worker', or 'auto'"
+      );
     }
 
     if (body.audioFormat !== undefined && !VALID_AUDIO_FORMATS.includes(body.audioFormat)) {
@@ -73,8 +83,8 @@ export async function POST(request: NextRequest) {
       throw new AppError("INVALID_INPUT", "keepHistory must be a boolean");
     }
 
-    settingsRepository.setAll(body as AppSettings);
-    const settings = settingsRepository.getAll();
+    await settingsRepository.setAll(body);
+    const settings = await settingsRepository.getAll();
 
     return ok({ settings });
   } catch (err) {

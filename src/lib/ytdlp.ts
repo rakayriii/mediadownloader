@@ -1,9 +1,12 @@
-import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { readdir, rename, stat } from "node:fs/promises";
 import { AppError } from "@/lib/errors";
 import {
   ANALYZE_TIMEOUT_MS,
+  CACHE_DIR,
   DOWNLOAD_TIMEOUT_MS,
   DOWNLOADS_DIR,
   resolveFfmpegPath,
@@ -47,6 +50,13 @@ export function ytdlpVersion(): Promise<string | null> {
     .catch(() => null);
 }
 
+/** Version string resolved at most once per process. */
+let cachedYtdlpVersionPromise: Promise<string | null> | null = null;
+function cachedYtdlpVersion(): Promise<string | null> {
+  cachedYtdlpVersionPromise ??= ytdlpVersion();
+  return cachedYtdlpVersionPromise;
+}
+
 /** Strip characters that are illegal or dangerous in file names. */
 export function sanitizeFilename(raw: string, maxLength = 160): string {
   const cleaned = raw
@@ -61,19 +71,110 @@ interface AnalyzeOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Short-TTL in-memory cache for analyze results (keyed by resolved URL).
+ * Real results are cached briefly so re-analyzing the same link (common when
+ * the user tweaks settings or redownloads) is instant instead of waiting on
+ * the media host again. Cache entries are plain objects we already returned,
+ * so this never mocks or fabricates metadata.
+ */
+const ANALYZE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour — long enough to cover an active session
+/** How long persisted info dumps stay valid for the extraction-skip fast path. */
+export const ANALYZE_INFO_TTL_MS = ANALYZE_CACHE_TTL_MS;
+const ANALYZE_CACHE_MAX = 100;
+const analyzeCache = new Map<
+  string,
+  { expiresAt: number; media: MediaInfo }
+>();
+
+function getCachedAnalyze(url: string): MediaInfo | null {
+  const hit = analyzeCache.get(url);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    analyzeCache.delete(url);
+    return null;
+  }
+  return hit.media;
+}
+
+function storeAnalyze(url: string, media: MediaInfo): void {
+  if (analyzeCache.size >= ANALYZE_CACHE_MAX) {
+    const oldest = analyzeCache.keys().next().value;
+    if (oldest !== undefined) analyzeCache.delete(oldest);
+  }
+  analyzeCache.set(url, { expiresAt: Date.now() + ANALYZE_CACHE_TTL_MS, media });
+}
+
+/** Canonical URL form used as the cache key (mirrors analyzeMedia). */
+async function canonicalUrl(rawUrl: string): Promise<string> {
+  return (await assertValidUrl(rawUrl, { resolveDns: false })).toString();
+}
+
+/** On-disk path of the raw yt-dlp info dump for a URL. */
+export async function infoJsonPathFor(rawUrl: string): Promise<string> {
+  const url = await canonicalUrl(rawUrl);
+  const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+  return join(CACHE_DIR, `${hash}.info.json`);
+}
+
+/** Cached analyze hit for a URL (null on miss/expiry). */
+export async function getCachedAnalyzeForUrl(
+  rawUrl: string
+): Promise<MediaInfo | null> {
+  return getCachedAnalyze(await canonicalUrl(rawUrl));
+}
+
+/** Persist the raw yt-dlp info dump so downloads can skip re-extraction. */
+async function writeInfoJsonCache(url: string, dump: YtDump): Promise<void> {
+  try {
+    await mkdir(CACHE_DIR, { recursive: true });
+    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    await writeFile(
+      join(CACHE_DIR, `${hash}.info.json`),
+      JSON.stringify(dump),
+      "utf8"
+    );
+  } catch (err) {
+    console.error("[ytdlp] Failed to write info cache:", err);
+  }
+}
+
+/** True when a cached info dump exists for this URL and is fresh. */
+export function hasFreshInfoJson(path: string, ttlMs: number): boolean {
+  try {
+    if (!existsSync(path)) return false;
+    const { mtime } = statSync(path);
+    return Date.now() - mtime.getTime() <= ttlMs;
+  } catch {
+    return false;
+  }
+}
+
 /** Fetch full metadata + formats for a single media page. */
 export async function analyzeMedia(
   rawUrl: string,
   options: AnalyzeOptions = {}
 ): Promise<MediaInfo> {
   const bin = requireBinary();
-  const url = (await assertValidUrl(rawUrl)).toString();
+  // Skip DNS resolution for analysis - yt-dlp does its own validation
+  const url = (await assertValidUrl(rawUrl, { resolveDns: false })).toString();
+
+  // Resolve the binary version once per process so production failures are
+  // attributable (e.g. an old in-container yt-dlp vs. a network block).
+  const version = await cachedYtdlpVersion();
+  console.log(`[ytdlp] analyze url=${url} binary=${bin} v${version ?? "?"}`);
+
+  const cached = getCachedAnalyze(url);
+  if (cached) return cached;
 
   const args = [
     "-J",
     "--no-playlist",
     "--skip-download",
     "--no-warnings",
+    // Skip per-format URL probing: returns the same format list without
+    // spending a HEAD request on every stream URL. Saves ~1s on large lists.
+    "--no-check-formats",
     "--socket-timeout",
     "30",
     url,
@@ -154,6 +255,12 @@ export async function analyzeMedia(
   };
 
   void warnings;
+  storeAnalyze(url, media);
+  // Persist the raw info dump so an imminent download with this URL can skip
+  // yt-dlp's extraction entirely (the player-API round-trip is the slow part).
+  if (Array.isArray(dump.formats) && dump.formats.length > 0) {
+    void writeInfoJsonCache(url, dump);
+  }
   return media;
 }
 
@@ -172,6 +279,12 @@ interface DownloadOptions {
   timeoutMs?: number;
   /** Progress callback throttle (ms). */
   throttleMs?: number;
+  /**
+   * Path to a previously saved yt-dlp info dump. When provided, extraction is
+   * skipped entirely and yt-dlp downloads straight from the cached streams,
+   * eliminating the player-API round-trip before the first byte.
+   */
+  infoJsonPath?: string;
 }
 
 export interface DownloadOutcome {
@@ -232,18 +345,19 @@ function resolveProgress(
     if (line.startsWith(PROGRESS_MARKER)) {
       const body = line.slice(PROGRESS_MARKER.length);
       const [status, percent, speed, eta, downloaded, total] = body.split("|");
+      const pct = parsePercent(percent);
+      // A "downloading" line at 100% means the stream is complete (or yt-dlp
+      // capped the estimate) — show it as wrapping up, never as a frozen bar.
+      const finished = status === "finished" || pct === 100;
       const parsed: JobProgress = {
-        stage: status === "downloading" ? "downloading" : "finalizing",
-        message: status === "finished" ? "Finalizing…" : undefined,
-        percent: parsePercent(percent),
+        stage: finished ? "finalizing" : "downloading",
+        message: finished ? "Finalizing…" : undefined,
+        percent: pct,
         speed: cleanField(speed),
         eta: cleanField(eta),
         downloadedBytes: toBytes(downloaded),
         totalBytes: toBytes(total),
       };
-      if (status === "finished" && parsed.percent === undefined) {
-        parsed.percent = 100;
-      }
       push(parsed);
       return;
     }
@@ -263,7 +377,13 @@ function resolveProgress(
       latest = {
         ...latest,
         stage,
-        message: message ?? (stage === "downloading" ? "Downloading…" : stage),
+        message:
+          message ??
+          (stage === "downloading"
+            ? "Downloading…"
+            : stage === "processing"
+              ? "Processing audio/video…"
+              : "Finalizing…"),
       };
     },
   };
@@ -359,6 +479,11 @@ export async function downloadMedia(options: DownloadOptions): Promise<DownloadO
     args.push("-x");
     if (options.audioFormat) args.push("--audio-format", options.audioFormat);
     if (options.audioQuality) args.push("--audio-quality", options.audioQuality);
+  }
+
+  // Skip extraction using a previously saved info dump (fast path).
+  if (options.infoJsonPath) {
+    args.push("--load-info-json", options.infoJsonPath);
   }
 
   args.push(url);

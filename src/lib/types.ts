@@ -11,6 +11,22 @@ export type JobStatus =
   | "failed"
   | "cancelled";
 
+/**
+ * Execution backend that actually runs yt-dlp + ffmpeg for a job.
+ * "vercel" = the Next.js server itself (in-process), "worker" = the remote
+ * download worker process (residential IP) reached over its authorized API.
+ */
+export type ExecutorKind = "vercel" | "worker";
+
+/**
+ * Routing policy for new jobs:
+ * - "vercel": always run in-process (Vercel behaves like today).
+ * - "worker": always submit to the remote worker.
+ * - "auto": try Vercel first; on a network/extractor failure hand the job off
+ *   to the worker exactly once (no blind retry loops).
+ */
+export type ExecutionMode = "vercel" | "worker" | "auto";
+
 export type BatchStatus =
   | "queued"
   | "running"
@@ -107,6 +123,13 @@ export interface DownloadJob {
   formatId?: string;
   ext?: string | null;
   status: JobStatus;
+  /** Backend that owns/runs this job (absent unless explicitly routed). */
+  executor?: ExecutorKind;
+  /**
+   * Original error preserved when a job is handed off from Vercel to the
+   * worker (never hidden; surfaced again if the worker also fails).
+   */
+  handoffError?: string | null;
   progress: JobProgress | null;
   error?: string | null;
   errorCode?: ErrorCodeString | null;
@@ -176,6 +199,8 @@ export interface AppSettings {
   audioQuality: string;
   /** yt-dlp binary override (may be empty to auto-detect). */
   ytdlpPath: string;
+  /** Execution routing: "vercel" | "worker" | "auto". */
+  executionMode: ExecutionMode;
 }
 
 export interface ApiOk<T> {

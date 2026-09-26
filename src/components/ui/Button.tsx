@@ -22,7 +22,8 @@ export function Button({
     "inline-flex items-center justify-center font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-surface rounded-md disabled:opacity-50 disabled:cursor-not-allowed";
 
   const variants = {
-    primary: "bg-primary text-on-primary hover:brightness-110 focus:ring-primary",
+    primary:
+      "bg-gradient-to-r from-primary to-secondary text-white hover:brightness-110 focus:ring-primary",
     secondary: "bg-surface-container border border-outline text-on-surface hover:bg-surface-container-high focus:ring-outline",
     ghost: "bg-transparent text-on-surface hover:bg-surface-container focus:ring-outline",
     danger: "bg-error text-on-error hover:brightness-110 focus:ring-error",

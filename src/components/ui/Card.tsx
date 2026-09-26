@@ -13,7 +13,7 @@ export function Card({ children, className = "", hover = false, onClick }: CardP
   return (
     <div
       className={`
-        bg-surface-container border border-outline rounded-lg p-5
+        bg-surface-container border border-outline rounded-xl p-5
         transition-colors duration-150
         ${hover ? "hover:bg-surface-container-high cursor-pointer" : ""}
         ${onClick ? "cursor-pointer" : ""}
