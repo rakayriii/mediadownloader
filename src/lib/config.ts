@@ -93,6 +93,19 @@ export function resolveYtdlpPath(): string | null {
   return null;
 }
 
+/** Base URL of the optional remote download worker (API → worker). */
+export function workerUrl(): string {
+  return (process.env.WORKER_URL ?? "http://127.0.0.1:8787").replace(/\/+$/, "");
+}
+
+/**
+ * Shared secret for API ↔ worker authentication. Empty means the worker
+ * integration is disabled (worker mode unavailable, AUTO never hands off).
+ */
+export function workerSharedSecret(): string {
+  return process.env.WORKER_SHARED_SECRET?.trim() ?? "";
+}
+
 /** Locate ffmpeg; falls back to PATH lookup result. */
 export function resolveFfmpegPath(): string | null {
   if (process.env.FFMPEG_PATH && existsSync(process.env.FFMPEG_PATH)) {

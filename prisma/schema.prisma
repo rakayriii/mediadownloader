@@ -26,6 +26,8 @@ model Download {
   fileName    String?
   sizeBytes   BigInt?
   batchId     String?
+  executor    String? // "vercel" | "worker": which backend runs this job
+  handoffError String? // original error kept when a job is handed off to the worker
   createdAt   DateTime @default(now())
   startedAt   DateTime?
   completedAt DateTime?

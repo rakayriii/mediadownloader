@@ -30,8 +30,11 @@ import {
   mirrorToStorage,
   mimeForExt,
 } from "@/lib/storage";
+import { initialExecutorKind, isHandoffErrorCode } from "@/lib/executors";
+import { workerClient, workerConfigured, type WorkerJobPayload } from "@/lib/worker-client";
 import type {
   DownloadJob,
+  ExecutorKind,
   JobStatus,
   JobType,
   AppSettings,
@@ -62,6 +65,10 @@ export interface CreateDownloadInput {
 export interface JobHandle {
   id: string;
   status: JobStatus;
+}
+
+function isTerminalStatus(status: JobStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 export class JobManager {
@@ -131,10 +138,20 @@ export class JobManager {
     return [...liveOnly, ...rowsWithLive].slice(0, 200);
   }
 
+  /** Number of jobs currently executing in this process (worker health). */
+  get activeCount(): number {
+    return this.active;
+  }
+
   /** Create and enqueue a download job. Returns once the job is persisted. */
-  async create(input: CreateDownloadInput): Promise<DownloadJob> {
-    const id = randomUUID();
+  async create(
+    input: CreateDownloadInput,
+    opts: { id?: string; executor?: ExecutorKind } = {}
+  ): Promise<DownloadJob> {
+    const id = opts.id ?? randomUUID();
     const now = new Date().toISOString();
+    const executor: ExecutorKind =
+      opts.executor ?? initialExecutorKind(this.settings().executionMode);
     const job: DownloadJob = {
       id,
       type: input.type,
@@ -146,6 +163,7 @@ export class JobManager {
       formatId: input.formatId,
       ext: input.ext ?? null,
       status: "queued",
+      executor,
       progress: { stage: "queued", message: "Waiting in queue…" },
       batchId: input.batchId ?? null,
       createdAt: now,
@@ -154,14 +172,30 @@ export class JobManager {
     };
 
     this.registry.set(id, job);
-    if (this.settings().keepHistory) {
-      // Persist BEFORE enqueueing so the job's first status update (running)
-      // can never race a missing row. Failures are logged, not fatal.
+    // Worker-owned jobs are ALWAYS persisted: the worker is a separate process
+    // that can only see the job through the shared database (keepHistory=false
+    // only suppresses new local-only jobs, never worker-routed ones).
+    if (executor === "worker" || this.settings().keepHistory) {
       try {
         await downloadRepository.insert(job);
       } catch (err) {
         console.error("[JobManager] Failed to persist new job:", err);
       }
+    }
+
+    // Worker routing: persist first, then hand off. The in-memory registry
+    // must NOT hold worker-owned jobs. The DB row is authoritative and the
+    // worker updates it directly, so stale registry state would hide progress.
+    if (executor === "worker") {
+      try {
+        await workerClient.submit(payloadFromJob(job));
+      } catch (err) {
+        const appError = toAppError(err);
+        await this.markFailed(id, appError.code, appError.message);
+        throw appError;
+      }
+      this.registry.delete(id);
+      return job;
     }
 
     this.enqueue(async () => {
@@ -179,24 +213,43 @@ export class JobManager {
     const controller = this.abortControllers.get(id);
     controller?.abort();
     this.abortControllers.delete(id);
-    if (job.status === "queued") {
+    if (!this.registry.has(id)) {
+      // Job is owned by an external executor (the worker). If the worker was
+      // reachable it already marked the row cancelled via its own cancel().
+      // Re-read to avoid clobbering a completed/cancelled state; otherwise
+      // mark it cancelled here so it can never stay "running" forever.
+      const fresh = await downloadRepository.get(id);
+      if (
+        fresh &&
+        (fresh.status === "completed" ||
+          fresh.status === "cancelled" ||
+          fresh.status === "failed")
+      ) {
+        return fresh;
+      }
+      await this.markCancelled(id);
+    } else if (job.status === "queued") {
       await this.markCancelled(id);
     }
     return this.get(id);
   }
 
-  /** Reset a failed/cancelled job and re-enqueue it. */
+  /** Reset a failed/cancelled job and re-enqueue it (respecting routing). */
   async retry(id: string): Promise<DownloadJob | null> {
     const job = await this.get(id);
     if (!job) return null;
     if (job.status === "running" || job.status === "queued") return job;
 
+    const executor: ExecutorKind =
+      job.executor ?? initialExecutorKind(this.settings().executionMode);
     const reset: DownloadJob = {
       ...job,
+      executor,
       status: "queued",
       progress: { stage: "queued", message: "Waiting in queue…" },
       error: null,
       errorCode: null,
+      handoffError: null,
       fileName: null,
       sizeBytes: null,
       completedAt: null,
@@ -205,21 +258,41 @@ export class JobManager {
     this.registry.set(id, reset);
     await this.persist(reset);
 
+    if (executor === "worker") {
+      try {
+        await workerClient.submit(payloadFromJob(reset));
+      } catch (err) {
+        const appError = toAppError(err);
+        await this.markFailed(id, appError.code, appError.message);
+        throw appError;
+      }
+      this.registry.delete(id);
+      return reset;
+    }
+
     this.enqueue(async () => {
-      await this.runJob(id, {
-        url: job.url,
-        type: job.type,
-        formatId: job.formatId,
-        audioFormat: undefined,
-        audioQuality: undefined,
-        title: job.title ?? undefined,
-        uploader: job.uploader ?? undefined,
-        thumbnail: job.thumbnail ?? undefined,
-        duration: job.duration ?? undefined,
-        batchId: job.batchId ?? undefined,
-      });
+      await this.runJob(id, buildInputFromJob(reset));
     });
     return reset;
+  }
+
+  /** Run a job row that already exists in the database (worker entry point). */
+  async runExisting(id: string): Promise<DownloadJob | null> {
+    // The DB row is authoritative for jobs owned by an external executor: a
+    // resubmit (e.g. retry after the API reset the row) must never be shadowed
+    // by a stale terminal in-memory copy from the previous run.
+    const dbJob = await downloadRepository.get(id);
+    if (!dbJob) return null;
+    if (isTerminalStatus(dbJob.status)) return dbJob;
+    const live = this.registry.get(id);
+    if (live && !isTerminalStatus(live.status)) return live;
+    // No live run; drop any stale entry and (re)start from the DB row.
+    this.registry.delete(id);
+    if (this.removedJobs.has(id)) return dbJob;
+    this.enqueue(async () => {
+      await this.runJob(id, buildInputFromJob(dbJob));
+    });
+    return dbJob;
   }
 
   /** Remove a job from history + registry and delete its output file. */
@@ -407,7 +480,7 @@ export class JobManager {
           return;
         }
         const appError = toAppError(err);
-        await this.markFailed(id, appError.code, appError.message, appError.details);
+        await this.handleFailed(id, appError.code, appError.message, appError.details);
         return;
       }
     }
@@ -488,7 +561,7 @@ export class JobManager {
         // Only the extraction-skip fast path is retried; a genuinely failing
         // download (cached streams may have expired) is fatal after retry.
         if (lastError.code !== "DOWNLOAD_ERROR" || !attempt.infoJsonPath) {
-          await this.markFailed(
+          await this.handleFailed(
             id,
             lastError.code,
             lastError.message,
@@ -508,7 +581,7 @@ export class JobManager {
     }
     if (!outcome) return;
     if (lastError) {
-      await this.markFailed(id, lastError.code, lastError.message, lastError.details);
+      await this.handleFailed(id, lastError.code, lastError.message, lastError.details);
       return;
     }
 
@@ -564,7 +637,86 @@ export class JobManager {
       ext: outcome.ext,
       fileName: outcome.fileName,
       sizeBytes: outcome.sizeBytes,
+      // A handed-off job must not carry its old failure into "completed".
+      error: null,
+      errorCode: null,
+      handoffError: null,
     });
+  }
+
+  /**
+   * Unified local-failure handler. In AUTO mode a network/extractor failure
+   * (the datacenter-IP block case) is handed off to the worker EXACTLY once,
+   * never retried blindly, so the job still succeeds when the worker can
+   * reach the source. The original error is kept (handoffError) and merged
+   * back in if the worker also fails. Everything else fails like today.
+   */
+  private async handleFailed(
+    id: string,
+    code: string,
+    message: string,
+    details?: unknown
+  ): Promise<void> {
+    const job = await this.get(id);
+    if (!job) return;
+    if (
+      this.settings().executionMode === "auto" &&
+      job.executor !== "worker" &&
+      workerConfigured() &&
+      isHandoffErrorCode(code)
+    ) {
+      await this.handoffToWorker(id, code, message, details);
+      return;
+    }
+    await this.markFailed(id, code, message, details);
+  }
+
+  private async handoffToWorker(
+    id: string,
+    code: string,
+    message: string,
+    details?: unknown
+  ): Promise<void> {
+    if (this.removedJobs.has(id)) return;
+    const current = await this.get(id);
+    if (!current) return;
+    const original =
+      details !== undefined
+        ? typeof details === "string"
+          ? details
+          : JSON.stringify(details)
+        : message;
+    const next: DownloadJob = {
+      ...current,
+      status: "queued",
+      executor: "worker",
+      error: null,
+      errorCode: null,
+      handoffError: current.handoffError ?? original.slice(0, 2000),
+      startedAt: null,
+      completedAt: null,
+      progress: {
+        stage: "queued",
+        message: "Blocked on this server; handing off to the local worker…",
+      },
+    };
+    this.registry.set(id, next);
+    await this.persist(next);
+    // Keep the DB row authoritative; the worker owns it from here.
+    this.registry.delete(id);
+    this.abortControllers.delete(id);
+    void this.closeWorkDir(id);
+    try {
+      await workerClient.submit(payloadFromJob(next));
+    } catch (err) {
+      const handoffErr = toAppError(err);
+      console.error(`[JobManager] Worker handoff failed for ${id}:`, handoffErr.message);
+      await this.markFailed(
+        id,
+        code,
+        `${message}; Worker handoff failed: ${handoffErr.message}`
+      );
+    }
   }
 
   private async markFailed(
@@ -588,6 +740,12 @@ export class JobManager {
       const detailStr =
         typeof details === "string" ? details : JSON.stringify(details);
       next.error = detailStr.length > 400 ? `${detailStr.slice(0, 400)}…` : detailStr;
+    }
+    // A job that was handed off to the worker keeps the original server-side
+    // error in handoffError. If the worker also fails, surface both attempts in
+    // the visible error field so nothing is hidden from the UI.
+    if (current.handoffError && next.error !== current.handoffError) {
+      next.error = `${next.error}; original server attempt failed: ${current.handoffError}`;
     }
     this.registry.set(id, next);
     await downloadRepository.update(next);
@@ -624,6 +782,36 @@ function toAppError(err: unknown): AppError {
   if (err instanceof AppError) return err;
   if (err instanceof Error) return new AppError("INTERNAL", err.message);
   return new AppError("INTERNAL");
+}
+
+/** Structured, whitelisted payload for the worker (never free-form commands). */
+function payloadFromJob(job: DownloadJob): WorkerJobPayload {
+  return {
+    jobId: job.id,
+    url: job.url,
+    type: job.type,
+    formatId: job.formatId,
+    title: job.title ?? undefined,
+    uploader: job.uploader ?? undefined,
+    thumbnail: job.thumbnail ?? undefined,
+    duration: job.duration ?? undefined,
+    ext: job.ext ?? undefined,
+    batchId: job.batchId ?? undefined,
+  };
+}
+
+/** Rebuild run-input from a persisted job row (retry + worker entry). */
+function buildInputFromJob(job: DownloadJob): CreateDownloadInput {
+  return {
+    url: job.url,
+    type: job.type,
+    formatId: job.formatId,
+    title: job.title ?? undefined,
+    uploader: job.uploader ?? undefined,
+    thumbnail: job.thumbnail ?? undefined,
+    duration: job.duration ?? undefined,
+    batchId: job.batchId ?? undefined,
+  };
 }
 
 /** Process-wide singleton so hot reloads share the queue. */

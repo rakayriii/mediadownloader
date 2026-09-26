@@ -19,6 +19,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   audioFormat: "mp3",
   audioQuality: "5",
   ytdlpPath: "",
+  executionMode: "auto",
 };
 
 export function useSettings(): UseSettingsReturn {

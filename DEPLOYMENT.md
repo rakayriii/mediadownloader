@@ -78,6 +78,10 @@ curl -s -X POST https://.../api/analyze -H "Content-Type: application/json" \
 - **Region.** `regions: ["sin1"]` di `vercel.json` = instance berjalan di
   Singapura (latensi baik untuk Indonesia). Build selalu jalan di `iad1`
   (Washington, D.C.) — normal.
+- **TikTok/Instagram diblokir di Vercel.** IP datacenter Vercel diblokir
+  oleh TikTok/IG di level TLS/network (deterministik; tidak bisa diperbaiki
+  dari kode di sisi server). Gunakan **download worker** (bagian 9) yang
+  berjalan di mesin dengan IP residential untuk sumber-sumber ini.
 
 ## 7. Catatan Dockerfile
 
@@ -124,3 +128,97 @@ Perilaku:
 - Tanpa env SUPABASE_* fitur ini non-aktif (perilaku disk-only, cocok untuk
   dev lokal). Akses file pakai service-role key dari server-side saja; browser
   tidak pernah melihat key tersebut.
+
+## 9. Download Worker (untuk TikTok/Instagram)
+
+TikTok dan beberapa sumber lain **memblokir IP datacenter Vercel** secara
+deterministik (blokir di level TLS/network), jadi download dari Vercel
+selamanya gagal terlepas dari kode. Solusinya: **download worker**, sebuah
+proses Node mandiri yang dijalankan di mesin biasa (IP residential/non
+datacenter) dan menjalankan workflow yt-dlp + ffmpeg yang **persis sama**
+dengan server (fungsi di `src/lib/ytdlp.ts` tidak diubah).
+
+Arsitektur: Next.js (Vercel) tetap API + UI + PostgreSQL (source of truth),
+logika download jalan di worker; file selesai tetap di-mirror ke Supabase
+Storage. Worker **bukan** endpoint command: hanya menerima data job terstruktur
+(`jobId`, `url`, `formatId`, opsi audio, metadata) dan memakai kredensial
+auth berupa shared secret.
+
+### 9.1 Mode routing
+
+`executionMode` di Settings (`GET/POST /api/settings`) atau override
+per-request `executor` di body `POST /api/downloads`:
+
+- `vercel`: jalankan di server ini (perilaku lama).
+- `worker`: kirim langsung ke worker.
+- `auto` (default): coba server ini dulu. Jika gagal dengan error
+  network/extractor (`YTDLP_ERROR`, `TIMEOUT`, `DOWNLOAD_ERROR`), job
+  di-*handoff* ke worker **sekali saja**; tidak ada retry buta 6×. Error
+  asli disimpan di field `handoffError` (dan digabung ke pesan job bila
+  worker ikut gagal); error user (format salah dsb.) tidak pernah di-handoff.
+
+`retry` mempertahankan executor job; `cancel` membatalkan di worker
+(menghentikan proses download di sana).
+
+### 9.2 Env (worker & Vercel)
+
+```
+WORKER_URL            # URL endpoint worker, mis. http://127.0.0.1:8787 (dev)
+WORKER_SHARED_SECRET  # random hex kuat, SAMA di mesin worker dan Vercel
+```
+
+- Mesin worker: taruh di `.env.local` bersama `DATABASE_URL` (worker menulis
+  status job langsung ke PostgreSQL yang sama).
+- Vercel: `vercel env add WORKER_URL production` dan
+  `vercel env add WORKER_SHARED_SECRET production`.
+
+**Penting:** Vercel production tidak bisa menjangkau `127.0.0.1` mesin rumah.
+`WORKER_URL` production harus URL yang bisa diakses Vercel (domain publik,
+tunnel, atau VPN ke mesin rumah Anda). Tanpa `WORKER_URL`/secret, worker
+non-aktif dan semua job jalan lokal (`auto` = `vercel`).
+
+### 9.3 Menjalankan worker
+
+```bash
+npm ci
+# pastikan .env.local berisi DATABASE_URL, WORKER_URL, WORKER_SHARED_SECRET
+npm run worker          # tsx worker/index.ts, listen di WORKER_URL
+```
+
+Contoh unit systemd (`/etc/systemd/system/mediavault-worker.service`):
+
+```
+[Unit]
+Description=MediaVault download worker
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=/home/anda/mediavault
+ExecStart=/usr/bin/npm run worker
+Restart=always
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Poin keamanan (sudah diterapkan di kode):
+- Tanpa `WORKER_SHARED_SECRET` worker menolak start.
+- Setiap request diverifikasi Bearer secret dengan perbandingan timing-safe.
+- Hanya payload job terstruktur diterima; validasi URL penuh dipertahankan
+  (tanpa melemahkan), DNS probe dilewati seperti di API.
+- Worker memakai yt-dlp/ffmpeg workflow yang sama; tidak ada proxy/cookie
+  atau jalur anti-bot baru.
+- Jangan expose worker ke internet tanpa HTTPS/tunnel; itu solusi untuk akses
+  Vercel, bukan untuk publik.
+
+### 9.4 Verifikasi
+
+```bash
+curl -s -H "Authorization: Bearer $WORKER_SHARED_SECRET" $WORKER_URL/v1/health
+# => {"data":{"ok":true,"service":"mediavault-worker",...}}
+
+# di Vercel, tes job TikTok:
+curl -s -X POST https://<deploy>/api/downloads -H "Content-Type: application/json" \
+  -d '{"url":"https://www.tiktok.com/...","type":"video","executor":"worker"}'
+```

@@ -2,13 +2,15 @@ import { NextRequest } from "next/server";
 import { fail, ok } from "@/lib/api";
 import { AppError } from "@/lib/errors";
 import { jobManager } from "@/lib/jobs";
-import { downloadRepository } from "@/lib/db";
+import { downloadRepository, settingsRepository } from "@/lib/db";
 import { assertValidUrl } from "@/lib/validation";
-import type { JobType } from "@/lib/types";
+import { initialExecutorKind } from "@/lib/executors";
+import type { ExecutionMode, JobType } from "@/lib/types";
 
 export const runtime = "nodejs";
 
 const VALID_AUDIO_FORMATS = ["mp3", "m4a", "opus", "wav", "aac", "flac", "vorbis"];
+const VALID_MODES: ExecutionMode[] = ["vercel", "worker", "auto"];
 
 interface CreateDownloadBody {
   url?: unknown;
@@ -21,6 +23,8 @@ interface CreateDownloadBody {
   thumbnail?: unknown;
   duration?: unknown;
   ext?: unknown;
+  /** Optional per-job routing override (defaults to the executionMode setting). */
+  executor?: unknown;
 }
 
 function str(value: unknown): string | undefined {
@@ -80,18 +84,37 @@ export async function POST(request: NextRequest) {
       throw new AppError("INVALID_INPUT", "duration must be a number");
     }
 
-    const job = await jobManager.create({
-      url,
-      type,
-      formatId,
-      audioFormat,
-      audioQuality,
-      title: str(body.title),
-      uploader: str(body.uploader),
-      thumbnail: str(body.thumbnail),
-      duration: typeof duration === "number" ? duration : undefined,
-      ext: str(body.ext),
-    });
+    // Per-job routing override wins; otherwise the executionMode setting.
+    let executorMode: ExecutionMode = (await settingsRepository.getAll())
+      .executionMode;
+    if (body.executor !== undefined) {
+      if (
+        typeof body.executor !== "string" ||
+        !VALID_MODES.includes(body.executor as ExecutionMode)
+      ) {
+        throw new AppError(
+          "INVALID_INPUT",
+          "executor must be 'vercel', 'worker', or 'auto'"
+        );
+      }
+      executorMode = body.executor as ExecutionMode;
+    }
+
+    const job = await jobManager.create(
+      {
+        url,
+        type,
+        formatId,
+        audioFormat,
+        audioQuality,
+        title: str(body.title),
+        uploader: str(body.uploader),
+        thumbnail: str(body.thumbnail),
+        duration: typeof duration === "number" ? duration : undefined,
+        ext: str(body.ext),
+      },
+      { executor: initialExecutorKind(executorMode) }
+    );
 
     return ok({ job }, { status: 201 });
   } catch (err) {

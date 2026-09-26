@@ -42,6 +42,16 @@ export async function POST(request: NextRequest) {
       body.concurrency = n;
     }
 
+    if (
+      body.executionMode !== undefined &&
+      !["vercel", "worker", "auto"].includes(body.executionMode)
+    ) {
+      throw new AppError(
+        "INVALID_INPUT",
+        "executionMode must be 'vercel', 'worker', or 'auto'"
+      );
+    }
+
     if (body.audioFormat !== undefined && !VALID_AUDIO_FORMATS.includes(body.audioFormat)) {
       throw new AppError(
         "INVALID_INPUT",

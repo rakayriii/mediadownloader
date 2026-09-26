@@ -5,6 +5,7 @@ import type {
   BatchStatus,
   BatchItemStatus,
   DownloadJob,
+  ExecutionMode,
   JobStatus,
 } from "@/lib/types";
 
@@ -29,6 +30,8 @@ type DownloadRow = {
   fileName: string | null;
   sizeBytes: bigint | null;
   batchId: string | null;
+  executor: string | null;
+  handoffError: string | null;
   createdAt: Date;
   startedAt: Date | null;
   completedAt: Date | null;
@@ -52,6 +55,8 @@ function rowToDownload(row: DownloadRow): DownloadJob {
     fileName: row.fileName,
     sizeBytes: row.sizeBytes ? Number(row.sizeBytes) : null,
     batchId: row.batchId,
+    executor: (row.executor as DownloadJob["executor"]) ?? undefined,
+    handoffError: row.handoffError,
     createdAt: row.createdAt.toISOString(),
     startedAt: row.startedAt?.toISOString() ?? null,
     completedAt: row.completedAt?.toISOString() ?? null,
@@ -89,6 +94,8 @@ export const downloadRepository = {
         fileName: job.fileName ?? null,
         sizeBytes: job.sizeBytes ? BigInt(job.sizeBytes) : null,
         batchId: job.batchId ?? null,
+        executor: job.executor ?? null,
+        handoffError: job.handoffError ?? null,
         createdAt: new Date(job.createdAt),
         startedAt: job.startedAt ? new Date(job.startedAt) : null,
         completedAt: job.completedAt ? new Date(job.completedAt) : null,
@@ -113,6 +120,8 @@ export const downloadRepository = {
         fileName: job.fileName ?? null,
         sizeBytes: job.sizeBytes ? BigInt(job.sizeBytes) : null,
         batchId: job.batchId ?? null,
+        executor: job.executor ?? null,
+        handoffError: job.handoffError ?? null,
         startedAt: job.startedAt ? new Date(job.startedAt) : null,
         completedAt: job.completedAt ? new Date(job.completedAt) : null,
       },
@@ -373,7 +382,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   audioFormat: "mp3",
   audioQuality: "5",
   ytdlpPath: "",
+  executionMode: "auto",
 };
+
+function parseExecutionMode(raw: string | undefined): ExecutionMode {
+  return raw === "worker" || raw === "vercel" || raw === "auto" ? raw : "auto";
+}
 
 let settingsCache: AppSettings | null = null;
 let settingsCachePromise: Promise<AppSettings> | null = null;
@@ -396,6 +410,7 @@ export const settingsRepository = {
           audioFormat: map.audioFormat ?? DEFAULT_SETTINGS.audioFormat,
           audioQuality: map.audioQuality ?? DEFAULT_SETTINGS.audioQuality,
           ytdlpPath: map.ytdlpPath ?? DEFAULT_SETTINGS.ytdlpPath,
+          executionMode: parseExecutionMode(map.executionMode),
         };
         return settingsCache;
       } finally {
