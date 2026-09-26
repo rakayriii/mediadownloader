@@ -384,19 +384,27 @@ export const settingsRepository = {
     if (settingsCachePromise) return settingsCachePromise;
 
     settingsCachePromise = (async () => {
-      const rows = await prisma.setting.findMany();
-      const map: Record<string, string> = {};
-      for (const row of rows) map[row.key] = row.value;
-      settingsCache = {
-        downloadPath: map.downloadPath ?? DEFAULT_SETTINGS.downloadPath,
-        defaultFormat: map.defaultFormat ?? DEFAULT_SETTINGS.defaultFormat,
-        concurrency: Number(map.concurrency ?? DEFAULT_SETTINGS.concurrency),
-        keepHistory: (map.keepHistory ?? String(DEFAULT_SETTINGS.keepHistory)) === "true",
-        audioFormat: map.audioFormat ?? DEFAULT_SETTINGS.audioFormat,
-        audioQuality: map.audioQuality ?? DEFAULT_SETTINGS.audioQuality,
-        ytdlpPath: map.ytdlpPath ?? DEFAULT_SETTINGS.ytdlpPath,
-      };
-      return settingsCache;
+      try {
+        const rows = await prisma.setting.findMany();
+        const map: Record<string, string> = {};
+        for (const row of rows) map[row.key] = row.value;
+        settingsCache = {
+          downloadPath: map.downloadPath ?? DEFAULT_SETTINGS.downloadPath,
+          defaultFormat: map.defaultFormat ?? DEFAULT_SETTINGS.defaultFormat,
+          concurrency: Number(map.concurrency ?? DEFAULT_SETTINGS.concurrency),
+          keepHistory: (map.keepHistory ?? String(DEFAULT_SETTINGS.keepHistory)) === "true",
+          audioFormat: map.audioFormat ?? DEFAULT_SETTINGS.audioFormat,
+          audioQuality: map.audioQuality ?? DEFAULT_SETTINGS.audioQuality,
+          ytdlpPath: map.ytdlpPath ?? DEFAULT_SETTINGS.ytdlpPath,
+        };
+        return settingsCache;
+      } finally {
+        // Clear the in-flight marker even on failure so a transient DB outage
+        // (e.g. the local Postgres container is down) does not wedge the
+        // settings endpoint for the rest of the process lifetime: the next
+        // call retries instead of returning this rejected promise forever.
+        settingsCachePromise = null;
+      }
     })();
     return settingsCachePromise;
   },
